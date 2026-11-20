@@ -32,7 +32,10 @@ def pcts(text):
     return [float(x) / 100 for x in re.findall(r"(\d+\.\d+)%", text)]
 
 
-def main(planner: str):
+def main(planner: str, paraphrases: bool = False):
+    if planner in ("llm", "auto"):
+        # free-tier keys allow ~15 requests/min; pace calls so the run measures the model, not the quota
+        os.environ.setdefault("LLM_MIN_INTERVAL_S", "4.5")
     eng = AnalystEngine(DB)
     con = duckdb.connect(DB, read_only=True)
     clean = "raw.transactions_clean"
@@ -48,6 +51,29 @@ def main(planner: str):
     T_CARD_OCT = sr(clean, "2026-10-01", "2026-10-25", "|AND t.method_id='CARD'")
     T_SEP = sr(clean, "2026-09-01", "2026-09-30")
     T_DELTA_LW = sr(clean, "2026-10-19", "2026-10-25", "|AND t.bank_id='B04'")
+
+    T_SHARE_5K = truth(con, f"""SELECT AVG((amount_inr > 5000)::INT) FROM {clean}
+        WHERE created_at >= DATE '2026-10-19' AND created_at < DATE '2026-10-26'""")
+    T_UPI_FAIL_2K = truth(con, f"""SELECT COUNT(*) FROM {clean} WHERE method_id = 'UPI' AND status = 'FAILED'
+        AND amount_inr > 2000 AND created_at >= DATE '2026-10-01' AND created_at < DATE '2026-11-01'""")
+
+    T_WEEKEND_LW = sr(clean, "2026-10-24", "2026-10-25")
+    T_UPI_LW = sr(clean, "2026-10-19", "2026-10-25", "|AND t.method_id='UPI'")
+    T_UPI_PW = sr(clean, "2026-10-12", "2026-10-18", "|AND t.method_id='UPI'")
+
+    def result_has(a, target, tol):
+        """Any numeric cell in the first row of a free-SQL result equals target (shares also as %)."""
+        df = a.tables.get("Result")
+        if df is None or not len(df):
+            return False
+        vals = [float(v) for v in df.iloc[0].tolist() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return any(abs(v - target) <= tol or abs(v / 100 - target) <= tol for v in vals)
+
+    def custom_condition(a, target, tol, needle):
+        # without an LLM the engine must refuse to drop the condition; with one, the SQL must be right
+        if planner == "rules":
+            return a.status == "clarify" and needle in a.message
+        return a.status == "answered" and (a.plan or {}).get("intent") == "free_sql" and result_has(a, target, tol)
 
     def close(xs, target, tol=0.0002):
         return any(abs(x - target) <= tol for x in xs)
@@ -101,6 +127,28 @@ def main(planner: str):
         ("sources_disagree", "Do settlements agree with transactions on success rate last week?",
          "head_of_payments", lambda a: "disagree" in a.headline and any("PENDING" in h for h in a.hypotheses),
          "explains source disagreement"),
+        ("custom_sql_share", "What share of transactions were above 5000 INR last week?", "head_of_payments",
+         lambda a: custom_condition(a, T_SHARE_5K, 2e-4, "5000"),
+         f"amount threshold applied, not dropped (share {T_SHARE_5K:.2%})"),
+        ("custom_sql_count", "How many failed UPI transactions over 2000 INR were there in October?",
+         "head_of_payments", lambda a: custom_condition(a, T_UPI_FAIL_2K, 0.5, "2000"),
+         f"amount threshold applied, not dropped (count {T_UPI_FAIL_2K:,})"),
+        ("premise_check", "Why did GMV drop last week?", "head_of_payments",
+         lambda a: a.status == "answered" and "actually rose" in a.headline,
+         "corrects a false premise (GMV rose)"),
+        ("action_question", "What action should we take on success rate last week?", "head_of_payments",
+         lambda a: a.status == "answered" and len(a.recommendations) >= 2, "returns recommendations"),
+        ("word_cond_weekend", "What was the success rate on weekends last week?", "head_of_payments",
+         lambda a: custom_condition(a, T_WEEKEND_LW, 2e-4, "weekends"),
+         f"weekend condition applied inside last week, 24-25 Oct ({T_WEEKEND_LW:.2%})"),
+        ("word_cond_vague", "Success rate for high-value payments last week", "head_of_payments",
+         lambda a: (a.status == "clarify" and "high-value" in a.message) if planner == "rules" else
+         (a.status == "answered" and (a.plan or {}).get("intent") == "free_sql"
+          and any("no standard definition" in c for c in a.caveats)),
+         "vague threshold never silently ignored; definition disclosed"),
+        ("hour_labels", "Success rate by hour of day last week", "head_of_payments",
+         lambda a: a.status == "answered" and str(a.tables[next(iter(a.tables))].iloc[0, 0]) == "00:00",
+         "hours shown as HH:00"),
     ]
     sql_cases = [
         ("guard_delete", "DELETE FROM transactions", "blocked"),
@@ -113,6 +161,7 @@ def main(planner: str):
     ]
 
     passed = 0
+    provider_errs = 0
     total = len(cases) + len(sql_cases) + 1
     cache = {}
     for cid, q, role, check, desc in cases:
@@ -124,7 +173,33 @@ def main(planner: str):
             ok = False
             desc += f" [check error: {e}]"
         passed += ok
-        print(f"{'PASS' if ok else 'FAIL'}  {cid:<22} {desc}")
+        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_errs += (not ok) and provider_err
+        tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
+        print(f"{tag:<8}  {cid:<22} {desc}" + ("  [model provider error, not a wrong answer]" if tag == "PROVIDER" else ""))
+    followups = [
+        ("followup_breakdown", "Why did success rate drop last week?", "Now break that down by bank",
+         lambda a: a.status == "answered" and abs(a.tables[next(iter(a.tables))].set_index("bank")
+                                                   .success_rate["Delta Co-op Bank"] - T_DELTA_LW) < 2e-4,
+         f"keeps metric + period from the previous question (Delta Co-op {T_DELTA_LW:.2%})"),
+        ("followup_slice", "Why did success rate drop last week?", "What about UPI?",
+         lambda a: a.status == "answered" and close(pcts(a.headline), T_UPI_LW) and close(pcts(a.headline), T_UPI_PW),
+         f"re-runs the diagnosis on UPI only ({T_UPI_PW:.2%} -> {T_UPI_LW:.2%})"),
+    ]
+    total += len(followups)
+    for cid, q1, q2, check, desc in followups:
+        first = cache.get((q1, "head_of_payments")) or eng.ask(q1, "head_of_payments", planner)
+        a = eng.ask(q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
+        try:
+            ok = bool(check(a))
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            desc += f" [check error: {e}]"
+        passed += ok
+        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_errs += (not ok) and provider_err
+        tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
+        print(f"{tag:<8}  {cid:<22} {desc}")
     for cid, sql, expect in sql_cases:
         a = eng.run_sql(sql, "head_of_payments")
         ok = a.status == expect
@@ -132,17 +207,70 @@ def main(planner: str):
         print(f"{'PASS' if ok else 'FAIL'}  {cid:<22} expect {expect}, got {a.status} {a.denial_rule or ''}")
 
     # provider outage mid-workflow -> graceful fallback
+    provider_before = eng.llm.provider
     eng.llm.provider, eng.llm.simulate_outage = "gemini", True
     a = eng.ask("Why did success rate drop last week?", "head_of_payments", "auto")
+    eng.llm.provider, eng.llm.simulate_outage = provider_before, False
     ok = a.status == "answered" and any(s.status == "fallback" for s in a.steps)
     passed += ok
     print(f"{'PASS' if ok else 'FAIL'}  {'provider_outage':<22} falls back to deterministic planner")
 
-    print(f"\n{passed}/{total} passed")
+    print(f"\n{passed}/{total} passed" + (f" ({provider_errs} not passed due to model-provider errors)"
+                                         if provider_errs else ""))
+    if paraphrases:
+        run_paraphrases(eng, planner)
     return 0 if passed == total else 1
+
+
+# Held-out rewordings: never used to write the planner prompt. They check the plan shape
+# (intent, metric, dimensions, window), so they measure how well the planner generalises.
+PARAPHRASES = [
+    ("What caused the dip in payment success over the past week?", "answered",
+     dict(intent="diagnose_change", metric="success_rate", window=("2026-10-19", "2026-10-25"))),
+    ("How did Card do compared with NetBanking in September?", "answered",
+     dict(intent="breakdown", dims=["method"], window=("2026-09-01", "2026-09-30"))),
+    ("Give me the daily success rate trend for October", "answered",
+     dict(intent="trend", window=("2026-10-01", "2026-10-25"))),
+    ("GMV by category last week", "answered", dict(intent="breakdown", metric="gmv", dims=["category"])),
+    ("Is the finance team's settlement data consistent with our transaction logs for last week?", "answered",
+     dict(intent="compare_sources")),
+    ("Why is success rate down?", "clarify", dict(intent="clarify")),
+    ("Success rate excluding pending for Coastal Bank last week", "answered",
+     dict(intent="breakdown", metric="success_rate_excl_pending")),
+    ("Why did success rate fall in January 2024?", "clarify", dict()),
+    ("Which merchants had the highest failure rate last week?", "answered",
+     dict(intent="breakdown", metric="failure_rate", dims=["merchant"])),
+    ("Top failure reasons last week", "answered", dict(intent="breakdown", dims=["failure_reason"])),
+]
+
+
+def run_paraphrases(eng, planner):
+    print("\nHeld-out paraphrases (plan shape):")
+    ok_n = 0
+    for q, status, exp in PARAPHRASES:
+        a = eng.ask(q, "head_of_payments", planner)
+        p = a.plan or {}
+        why = []
+        if a.status != status:
+            why.append(f"status {a.status}" + (f" ({a.message[:70]})" if a.status == "error" else ""))
+        if "intent" in exp and p.get("intent") != exp["intent"]:
+            why.append(f"intent {p.get('intent')}")
+        if "metric" in exp and p.get("metric") != exp["metric"]:
+            why.append(f"metric {p.get('metric')}")
+        if "dims" in exp and list(p.get("dimensions") or []) != exp["dims"]:
+            why.append(f"dims {p.get('dimensions')}")
+        if "window" in exp:
+            w = p.get("window") or {}
+            if (w.get("start"), w.get("end")) != exp["window"]:
+                why.append(f"window {w.get('start')}..{w.get('end')}")
+        ok_n += not why
+        print(f"{'PASS' if not why else 'FAIL'}  {q[:60]:<60} {'; '.join(why)}")
+    print(f"{ok_n}/{len(PARAPHRASES)} paraphrases planned correctly")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--planner", default="rules", choices=["rules", "llm", "auto"])
-    sys.exit(main(ap.parse_args().planner))
+    ap.add_argument("--paraphrases", action="store_true", help="also run held-out rewordings")
+    args = ap.parse_args()
+    sys.exit(main(args.planner, args.paraphrases))

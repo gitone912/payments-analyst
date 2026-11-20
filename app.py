@@ -189,10 +189,18 @@ with tab_ask:
     if pending:
         st.session_state.q = pending
     q = st.text_input("Question", key="q", placeholder="e.g. Why did success rate drop last week?")
+    prev = st.session_state.get("prev")
+    if prev and prev["role"] == role_key:
+        st.caption(f"Follow-ups such as \"now break that down by bank\" or \"what about UPI?\" build on: "
+                   f"*{prev['question']}*")
     clicked = st.button("Analyse", type="primary") or bool(pending)
     if clicked and q.strip():
         with st.spinner("Planning, validating and querying..."):
-            st.session_state.last = eng.ask(q, role_key, planner_mode)
+            context = prev if prev and prev["role"] == role_key else None
+            ans = eng.ask(q, role_key, planner_mode, previous=context)
+            st.session_state.last = ans
+            if ans.status == "answered" and ans.plan:
+                st.session_state.prev = {"question": q, "plan": ans.plan, "role": role_key}
     if "last" in st.session_state:
         render_answer(st.session_state.last)
 

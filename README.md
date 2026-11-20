@@ -19,17 +19,24 @@ each kept separate.
 pip install -r requirements.txt
 python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
 streamlit run app.py                    # UI at http://localhost:8501
-python evals/run_evals.py               # 27 known-answer / safety checks
-python -m pytest -q tests               # unit tests
+python evals/run_evals.py               # 36 known-answer / safety checks
+python -m pytest -q tests               # 14 unit tests
 python cli.py "why did success rate drop last week?" --sql
+python cli.py "why did success rate drop last week?" --then "now break that down by bank"
 ```
 
 Optional LLM planner (the system runs fully without one):
 
 ```bash
-export LLM_PROVIDER=gemini GEMINI_API_KEY=...            # or
+export LLM_PROVIDER=gemini GEMINI_API_KEY=...            # default model: gemini-3.5-flash-lite
 export LLM_PROVIDER=openai OPENAI_API_KEY=... [OPENAI_BASE_URL=... for Groq/OpenRouter/Ollama]
+export LLM_MODEL=...                                     # optional override
+export LLM_MIN_INTERVAL_S=4.5                            # optional pacing for free-tier keys (15 req/min)
+python evals/run_evals.py --planner llm --paraphrases    # evals against the live model
 ```
+
+The Gemini key is sent in the `x-goog-api-key` header, never in the URL, so it can't leak into logs or tracebacks.
+Older defaults (`gemini-2.0-flash`, `gemini-2.5-flash`) now return 404 for new keys.
 
 Deep link for demos: `http://localhost:8501/?q=Why did success rate drop last week?`
 
@@ -82,8 +89,50 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
   like that segment's rate dropping (e.g. "UPI got worse"). The eval suite checks this.
 - **Clarify rather than guess** when the comparison period or the denominator is missing.
   Lower-risk defaults (e.g. "last 7 days" for a snapshot) are applied and listed as assumptions.
+  The metric-ambiguity check is enforced in code on LLM plans too. If the model quietly picks a
+  measure for "how are we performing?", the engine overrides it with a clarification and logs an
+  `ambiguity_guard` step.
+- **Never silently drop a condition.** If the question contains something the catalog can't
+  express (an amount threshold, a distinct count, a percentile), a catalog plan would answer a
+  different question with full confidence. A coverage guard detects this (regex detector + the
+  model's own `unsupported` list) and re-plans as model-written SQL, which goes through the same
+  guard, or asks the user. It never answers while ignoring the condition.
+  Word conditions count too: weekends, time of day, "high-value"/"big transactions", and new or
+  returning customers. When the model picks a cut-off for a vague term, the definition goes into
+  the headline and a caveat.
+- **Period check on LLM plans.** The dates a model's plan (or SQL) uses must lie inside the period
+  the question names. A plan that answers "weekends last week" with 18-19 Oct is sent back once
+  with the error; if it is still wrong, the deterministic planner takes over.
+- **Follow-ups.** "Now break that down by bank" / "what about UPI?" keep the previous question's
+  metric, period, filters and analysis type (both planners). Standalone questions ignore it.
+- **Premise check.** "Why did GMV drop?" when GMV rose is answered with
+  "Premise check: ... it actually rose" before the numbers.
+- **LLM robustness**: tolerant JSON parsing (trailing commas), one retry with the validation
+  errors fed back, no retry on 429/5xx (falls back immediately), and an in-process plan cache so
+  re-asking a question costs no quota.
 - **Access control in two layers**: an explicit deny with a reason (PII column, merchant
   literal outside portfolio), and a row-level rewrite as defence in depth.
+
+## Evaluation results
+
+Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
+
+| Planner | Core suite (36 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
+|---|---|---|
+| Deterministic rules | 36/36 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
+| Gemini `gemini-3.5-flash-lite` (live) | 34/36 on the last full run, with the 2 misses being provider 503s; both pass when re-run | 10/10 |
+
+The core suite includes questions the catalog can't express: amount thresholds, "on weekends",
+and "high-value". With the LLM, the model writes SQL that matches the hand-written ground truth
+exactly. Without it, the engine asks instead of answering a different question. Two follow-up
+cases ("now break that down by bank", "what about UPI?") check that context carries over. The
+eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
+
+The paraphrases were written after the prompt was finalised and are not used as prompt examples.
+They show whether the planner generalises beyond the questions it was tuned against.
+Runs vary slightly even at temperature 0: in earlier runs the model occasionally chose a
+different plan (e.g. the "raw" question as a trend), and the provider sometimes returns 429/503. In `auto` mode those cases fall back
+to the rule planner, and the fallback is shown in the trace.
 
 ## Failure scenarios covered
 

@@ -33,6 +33,7 @@ class Plan:
     sql: str | None = None                      # free_sql only
     clarification: dict | None = None           # {"question": str, "options": [str]}
     assumptions: list[str] = field(default_factory=list)
+    unsupported: list[str] = field(default_factory=list)  # conditions the catalog plan cannot apply
 
     def to_dict(self) -> dict:
         d = asdict(self)

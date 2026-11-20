@@ -104,7 +104,8 @@ DIMENSIONS: dict[str, Dimension] = {
                                 "COALESCE(t.failure_reason, '(not failed)')"),
     "day": Dimension("day", "Day", "CAST(t.created_at AS DATE)"),
     "week": Dimension("week", "Week starting", "CAST(date_trunc('week', t.created_at) AS DATE)"),
-    "hour": Dimension("hour", "Hour of day", "EXTRACT(hour FROM t.created_at)"),
+    "hour": Dimension("hour", "Hour of day",
+                      "LPAD(CAST(EXTRACT(hour FROM t.created_at) AS VARCHAR), 2, '0') || ':00'"),
     # PII - exists so the question can be planned; the guard decides who may run it
     "customer_vpa": Dimension("customer_vpa", "Customer VPA", "t.customer_vpa"),
 }

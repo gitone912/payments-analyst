@@ -7,9 +7,12 @@ query ids that support it. The LLM (if configured) only produces the plan.
 from __future__ import annotations
 
 import copy
+import json
+import numbers
+import re
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -18,10 +21,11 @@ from .dq import DQFinding, run_checks
 from .drivers import Decomposition, decompose, overall_change_ci
 from .executor import Executor, QueryRecord, QueryTimeout
 from .guard import SqlGuard, UnsafeQuery
-from .llm import LLMCall, LLMPlanner
+from .llm import LLMCall, LLMPlanner, plan_from_json
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
-from .rule_planner import RulePlanner
+from .rule_planner import (RulePlanner, is_followup, metric_ambiguity, premise_direction,
+                           unmodelled_conditions)
 from .semantic import DIMENSIONS, METRICS
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
@@ -78,6 +82,7 @@ class Answer:
 
 class AnalystEngine:
     def __init__(self, db_path: str, llm_provider: str | None = None):
+        self._followup: tuple[Plan | None, str | None] = (None, None)
         self.ex = Executor(db_path)
         m = self.ex.raw("SELECT merchant_id, merchant_name, category, kam_portfolio FROM raw.merchants")
         self.merchants = m
@@ -111,15 +116,105 @@ class AnalystEngine:
         return df, rec
 
     # ------------------------------------------------------------ planning
-    def make_plan(self, question: str, ans: Answer, mode: str) -> Plan:
+    def make_plan(self, question: str, ans: Answer, mode: str, previous: dict | None = None) -> Plan:
+        prev_plan, ctx = None, None
+        if previous and previous.get("plan") and is_followup(question):
+            prev_plan = plan_from_json(json.dumps(previous["plan"]))
+            ctx = (f"Previous question: {previous.get('question', '')}\n"
+                   f"Previous plan: {json.dumps(previous['plan'], default=str)}")
+            ans.steps.append(Step("follow_up", "ok", f"treated as a follow-up to: {previous.get('question', '')}"))
+        self._followup = (prev_plan, ctx)
+        plan = self._make_plan(question, ans, mode)
+        plan = self._coverage_guard(question, plan, ans, mode)
+        if ans.planner_used.startswith("LLM") and plan.intent != "clarify":
+            plan = self._period_guard(question, plan, ans, mode)
+        return plan
+
+    def _period_problems(self, question: str, plan: Plan) -> list[str]:
+        """Does the plan stay inside the period the question names? Checked deterministically, because a
+        model that answers 'weekends last week' with 18-19 Oct (Sun + Mon) is wrong but looks right."""
+        prev_plan = self._followup[0]
+        rw, _, _ = self.rules.parse_time(" " + question.lower().strip() + " ")
+        if rw is None and prev_plan is not None:
+            rw = prev_plan.window
+        if rw is None:
+            return []
+        lo, hi = rw.start, rw.end
+        if plan.intent == "free_sql":
+            dates = [date.fromisoformat(d) for d in re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", plan.sql or "")]
+            if not dates:
+                return [f"the SQL has no date filter, but the question asks about {rw.label()}"]
+            bad = [d for d in dates if not (lo <= d <= hi + timedelta(days=1))]
+            return [f"the SQL uses {', '.join(map(str, bad))}, outside {lo}..{hi}"] if bad else []
+        if plan.window and (plan.window.start < lo or plan.window.end > hi):
+            return [f"the plan uses {plan.window.start}..{plan.window.end}, outside {lo}..{hi}"]
+        return []
+
+    def _period_guard(self, question: str, plan: Plan, ans: Answer, mode: str) -> Plan:
+        probs = self._period_problems(question, plan)
+        if not probs:
+            return plan
+        ans.steps.append(Step("period_check", "fail", "; ".join(probs)))
+        res = self.llm.plan(question, feedback=(
+            "Your plan failed the period check: " + "; ".join(probs)
+            + ". Every date you use must lie inside the period the question asks about. Return a corrected plan."),
+            context=self._followup[1])
+        ans.llm_calls.extend(res.calls)
+        if res.plan is not None and not self._period_problems(question, res.plan):
+            ans.steps.append(Step("period_check", "fixed", "model corrected its period after feedback"))
+            return self._coverage_guard(question, res.plan, ans, mode)
+        ans.steps.append(Step("period_check", "fallback", "model could not keep to the period; using the "
+                                                          "deterministic planner"))
+        ans.caveats.append("The language model's plan used the wrong dates, so the deterministic planner was used.")
+        ans.planner_used = "Deterministic rule planner (LLM plan rejected by period check)"
+        return self._coverage_guard(question, self.rules.plan(question, self._followup[0]), ans, "rules")
+
+    def _coverage_guard(self, question: str, plan: Plan, ans: Answer, mode: str) -> Plan:
+        """A catalog plan that silently drops a condition ("above 5000 INR") answers a different
+        question with full confidence. Detect that and route to guarded LLM SQL, or ask."""
+        if plan.intent == "free_sql":
+            return plan
+        gaps = list(dict.fromkeys(unmodelled_conditions(question) + list(plan.unsupported)))
+        if not gaps:
+            return plan
+        if plan.intent == "clarify" and ans.planner_used.startswith("LLM"):
+            return plan  # the model already chose to ask
+        ans.steps.append(Step("coverage_guard", "warn",
+                              f"plan '{plan.intent}' cannot apply: {'; '.join(gaps)}"))
+        if mode in ("auto", "llm") and self.llm.enabled and not self.llm.simulate_outage:
+            res = self.llm.plan(question, feedback=(
+                "Your catalog plan cannot apply these conditions from the question: " + "; ".join(gaps)
+                + ". Return intent free_sql with ONE SELECT that applies every condition, or clarify."),
+                context=self._followup[1])
+            ans.llm_calls.extend(res.calls)
+            if res.plan is not None and res.plan.intent in ("free_sql", "clarify"):
+                ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model}) - free SQL"
+                ans.steps.append(Step("coverage_guard", "rerouted",
+                                      f"re-planned as {res.plan.intent} so every condition is applied"))
+                return res.plan
+        ans.steps.append(Step("coverage_guard", "clarify", "no plan applies every condition; asking"))
+        cond = "; ".join(g.split(": ", 1)[-1] for g in gaps)
+        return Plan(intent="clarify", metric=plan.metric, clarification={
+            "question": (f"I can't apply {cond} with the standard metrics, and I won't answer while ignoring it. "
+                         "Enable the LLM planner (it can write a guarded custom query), use the SQL playground, "
+                         "or drop the condition."),
+            "options": []})
+
+    def _make_plan(self, question: str, ans: Answer, mode: str) -> Plan:
         t0 = time.perf_counter()
         if mode in ("auto", "llm") and self.llm.enabled:
-            res = self.llm.plan(question)
+            res = self.llm.plan(question, context=self._followup[1])
             ans.llm_calls.extend(res.calls)
             if res.plan is not None:
                 ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model})"
                 ans.steps.append(Step("plan", "ok", f"{ans.planner_used}, {len(res.calls)} call(s)",
                                       (time.perf_counter() - t0) * 1000))
+                amb = metric_ambiguity(question) if self._followup[0] is None else None
+                if amb is not None and res.plan.intent != "clarify":
+                    ans.steps.append(Step("ambiguity_guard", "override",
+                                          f"LLM chose metric '{res.plan.metric}' but the question names no "
+                                          "measure; asking instead of guessing"))
+                    return amb
                 return res.plan
             reason = "; ".join(res.errors) or "no plan"
             if mode == "llm":
@@ -128,7 +223,7 @@ class AnalystEngine:
                                   "fell back to deterministic planner"))
             ans.caveats.append("The language model was unavailable or returned an invalid plan, so the "
                                "deterministic planner was used. Supported question types still work.")
-        plan = self.rules.plan(question)
+        plan = self.rules.plan(question, self._followup[0])
         ans.planner_used = ans.planner_used or "Deterministic rule planner"
         ans.steps.append(Step("plan", "ok", "Deterministic rule planner", (time.perf_counter() - t0) * 1000))
         return plan
@@ -144,12 +239,14 @@ class AnalystEngine:
         return Window(s, e)
 
     # ------------------------------------------------------------ entry
-    def ask(self, question: str, role_key: str = "head_of_payments", planner_mode: str = "auto") -> Answer:
+    def ask(self, question: str, role_key: str = "head_of_payments", planner_mode: str = "auto",
+            previous: dict | None = None) -> Answer:
+        """previous: {"question": ..., "plan": ...} of the last answered question, for follow-ups."""
         t0 = time.perf_counter()
         role = ROLES[role_key]
         ans = Answer(question=question, role=role.label)
         try:
-            plan = self.make_plan(question, ans, planner_mode)
+            plan = self.make_plan(question, ans, planner_mode, previous)
             ans.plan = plan.to_dict()
             ans.assumptions.extend(plan.assumptions)
 
@@ -260,6 +357,19 @@ class AnalystEngine:
     def _fact(self, ans: Answer, text: str, *recs: QueryRecord) -> None:
         ans.facts.append({"text": text, "evidence": [r.query_id for r in recs]})
 
+    def _premise_check(self, ans: Answer, label: str, delta: float, rec: QueryRecord) -> None:
+        """Say so plainly when the question assumes the wrong direction ("why did GMV drop" when it rose)."""
+        asked = premise_direction(ans.question)
+        actual = "down" if delta < 0 else "up" if delta > 0 else None
+        if asked and actual and asked != actual:
+            said = "dropped" if asked == "down" else "rose"
+            did = "rose" if actual == "up" else "fell"
+            name = label if label[:3].isupper() else label.lower()
+            note = f"Premise check: the question assumes {name} {said}, but it actually {did}."
+            ans.headline = note + " " + ans.headline
+            self._fact(ans, note, rec)
+            ans.steps.append(Step("premise_check", "warn", note))
+
     # ------------------------------------------------------------ diagnose
     def _diagnose(self, plan: Plan, role: Role, ans: Answer) -> None:
         m = METRICS[plan.metric]
@@ -288,6 +398,7 @@ class AnalystEngine:
         direction = "fell" if d < 0 else "rose"
         ans.headline = (f"{m.label} {direction} from {fmt(m.key, ra)} to {fmt(m.key, rb)} "
                         f"({pts(d)}) between {b.label()} and {w.label()}.")
+        self._premise_check(ans, m.label, d, q_head)
         self._fact(ans, ans.headline + f" 95% CI for the change: {pts(lo)} to {pts(hi)}; "
                    f"attempts {na:,.0f} → {nb:,.0f} ({(nb / na - 1):+.0%}).", q_head)
         ans.steps.append(Step("headline", "ok", ans.headline))
@@ -433,9 +544,14 @@ class AnalystEngine:
         # confidence
         reasons = [f"Overall change is significant (CI excludes 0, n = {na + nb:,.0f})."]
         level = "high"
-        if any(c.startswith("Data quality (missing data)") for c in ans.caveats):
-            level = "medium"
-            reasons.append("An incomplete day falls inside the analysis window.")
+        gaps = [f for f in self.dq if f.check == "missing_data" and f.status != "pass"]
+        for nm, win in (("baseline", b), ("current", w)):
+            days = sorted({pd.Timestamp(x).date() for f in gaps for x in f.affected_days
+                           if win.start <= pd.Timestamp(x).date() <= win.end})
+            if days:
+                level = "medium"
+                reasons.append(f"Incomplete data on {', '.join(f'{x:%d %b}' for x in days)} falls in the "
+                               f"{nm} period, so that period's {m.label.lower()} carries a time-of-day bias.")
         if any("missing bank" in c for c in ans.caveats):
             reasons.append("Some bank_id values missing in window (small).")
         reasons.append("Driver attribution is descriptive (decomposition), not causal; causes are hypotheses.")
@@ -447,7 +563,9 @@ class AnalystEngine:
         va, vb = sa, sb
         if m.key == "attempts":
             va, vb = na, nb
-        ans.headline = f"{m.label} changed from {fmt(m.key, va)} to {fmt(m.key, vb)} ({(vb / va - 1):+.1%})."
+        direction = "fell" if vb < va else "rose"
+        ans.headline = f"{m.label} {direction} from {fmt(m.key, va)} to {fmt(m.key, vb)} ({(vb / va - 1):+.1%})."
+        self._premise_check(ans, m.label, vb - va, q_head)
         self._fact(ans, ans.headline, q_head)
         for dim in ["merchant", "method", "bank"]:
             df, rec = self._run(ans, role, compiler.two_period_segments(plan, [dim]), f"Contribution by {dim}")
@@ -589,8 +707,33 @@ class AnalystEngine:
     def _free_sql(self, plan: Plan, role: Role, ans: Answer) -> None:
         df, rec = self._run(ans, role, plan.sql, "Model-written SQL (validated by guard)")
         ans.tables["Result"] = df
-        ans.headline = f"Query returned {len(df)} row(s)."
+        if len(df) == 1 and 0 < len(df.columns) <= 4:
+            def show(col, v):
+                if isinstance(v, bool) or not isinstance(v, numbers.Real) or pd.isna(v):
+                    return str(v)
+                v = float(v)  # numpy / DuckDB numeric types included
+                if 0 <= v <= 1 and v % 1 and re.search(r"share|rate|pct|ratio|fraction|percent", col):
+                    return f"{v:.2%}"
+                return f"{v:,.2f}" if v % 1 else f"{v:,.0f}"
+            ans.headline = "; ".join(f"{c.replace('_', ' ')} = {show(c, df.iloc[0][c])}" for c in df.columns) + "."
+        else:
+            ans.headline = f"Query returned {len(df)} row(s)."
         self._fact(ans, ans.headline + " Values are shown exactly as returned.", rec)
+        vague = [g.split(": ", 1)[-1].strip("'") for g in unmodelled_conditions(ans.question)
+                 if g.startswith("vague threshold")]
+        if vague:
+            stem = re.split(r"[- ]", vague[0])[0]
+            defs = ([a for a in plan.assumptions if re.search(r"\d", a)
+                     and re.search(rf"{re.escape(stem)}|amount|hour|value|ticket", a, re.I)]
+                    or [a for a in plan.assumptions if re.search(r"\d", a)])
+            if defs:
+                ans.headline += " Definition used: " + "; ".join(defs) + "."
+                ans.facts[-1]["text"] = ans.headline + " Values are shown exactly as returned."
+                ans.caveats.append(f"'{vague[0]}' has no standard definition in this dataset. The model chose: "
+                                   + "; ".join(defs) + ". A different cut-off would give a different answer.")
+            else:
+                ans.caveats.append(f"'{vague[0]}' has no standard definition and the model did not state the one "
+                                   "it used. Read the SQL in the Evidence tab before relying on this number.")
         ans.caveats.append("This SQL was written by the language model (no catalog plan fitted). It passed the "
                            "safety guard, but check that it answers your question.")
         ans.confidence = {"level": "medium", "reasons": ["Model-written query; logic not template-verified."]}
