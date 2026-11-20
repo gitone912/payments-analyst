@@ -20,16 +20,22 @@ pip install -r requirements.txt
 python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
 streamlit run app.py                    # UI at http://localhost:8501
 python evals/run_evals.py               # 27 known-answer / safety checks
-python -m pytest -q tests               # unit tests
+python -m pytest -q tests               # 7 unit tests
 python cli.py "why did success rate drop last week?" --sql
 ```
 
 Optional LLM planner (the system runs fully without one):
 
 ```bash
-export LLM_PROVIDER=gemini GEMINI_API_KEY=...            # or
+export LLM_PROVIDER=gemini GEMINI_API_KEY=...            # default model: gemini-3.5-flash-lite
 export LLM_PROVIDER=openai OPENAI_API_KEY=... [OPENAI_BASE_URL=... for Groq/OpenRouter/Ollama]
+export LLM_MODEL=...                                     # optional override
+export LLM_MIN_INTERVAL_S=4.5                            # optional pacing for free-tier keys (15 req/min)
+python evals/run_evals.py --planner llm --paraphrases    # evals against the live model
 ```
+
+The Gemini key is sent in the `x-goog-api-key` header, never in the URL, so it can't leak into logs or tracebacks.
+Older defaults (`gemini-2.0-flash`, `gemini-2.5-flash`) now return 404 for new keys.
 
 Deep link for demos: `http://localhost:8501/?q=Why did success rate drop last week?`
 
@@ -82,8 +88,29 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
   like that segment's rate dropping (e.g. "UPI got worse"). The eval suite checks this.
 - **Clarify rather than guess** when the comparison period or the denominator is missing.
   Lower-risk defaults (e.g. "last 7 days" for a snapshot) are applied and listed as assumptions.
+  The metric-ambiguity check is enforced in code on LLM plans too. If the model quietly picks a
+  measure for "how are we performing?", the engine overrides it with a clarification and logs an
+  `ambiguity_guard` step.
+- **LLM robustness**: tolerant JSON parsing (trailing commas), one retry with the validation
+  errors fed back, no retry on 429/5xx (falls back immediately), and an in-process plan cache so
+  re-asking a question costs no quota.
 - **Access control in two layers**: an explicit deny with a reason (PII column, merchant
   literal outside portfolio), and a row-level rewrite as defence in depth.
+
+## Evaluation results
+
+Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
+
+| Planner | Core suite (27 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
+|---|---|---|
+| Deterministic rules | 27/27 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
+| Gemini `gemini-3.5-flash-lite` (live) | 27/27 | 8/10. Both misses were HTTP 503 from the provider; every plan the model returned was correct |
+
+The paraphrases were written after the prompt was finalised and are not used as prompt examples.
+They show whether the planner generalises beyond the questions it was tuned against.
+Runs vary slightly even at temperature 0: in one of four live runs the model planned the "raw" question
+as a trend, and the provider sometimes returns 429/503. In `auto` mode those cases fall back
+to the rule planner, and the fallback is shown in the trace.
 
 ## Failure scenarios covered
 

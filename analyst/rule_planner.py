@@ -6,6 +6,7 @@ is turned into a clarifying question rather than a guess.
 """
 from __future__ import annotations
 
+import copy
 import re
 from datetime import date, timedelta
 
@@ -35,6 +36,28 @@ DIM_PATTERNS = [
 METHOD_ALIASES = {"upi": "UPI", "card": "Card", "cards": "Card", "credit card": "Card",
                   "debit card": "Card", "netbanking": "NetBanking", "net banking": "NetBanking",
                   "nb": "NetBanking", "wallet": "Wallet", "wallets": "Wallet"}
+
+
+METRIC_CLARIFICATION = {
+    "question": "Which measure do you mean? 'Success rate' can use two denominators.",
+    "options": ["Success rate (successful / all attempts, incl. pending)",
+                "Success rate excluding pending (successful / successful + failed)",
+                "Failure rate", "GMV (successful amount)"]}
+
+
+def metric_ambiguity(question: str) -> Plan | None:
+    """Clarify plan if the question names no concrete measure but asks about 'performance', a bare
+    'rate', approval/conversion etc. Shared by both planners: the engine also applies it to LLM plans,
+    so "clarify rather than guess" is enforced in code, not left to the prompt."""
+    q = " " + question.lower().strip() + " "
+    concrete = (r"excl\w*\.? pending|without pending|terminal|success rate|\bsr\b|success ratio|success %|"
+                r"failure rate|fail rate|failures|failure reason|\bgmv\b|\btpv\b|revenue|value processed|amount|"
+                r"average ticket|avg ticket|\baov\b|ticket size|how many|volume|count|attempts|settlement")
+    if re.search(concrete, q):
+        return None
+    if re.search(r"approval rate|conversion|\brate\b|performance|performing|doing", q):
+        return Plan(intent="clarify", clarification=copy.deepcopy(METRIC_CLARIFICATION))
+    return None
 
 
 class RulePlanner:
@@ -130,12 +153,8 @@ class RulePlanner:
             metric = "avg_ticket"
         elif re.search(r"how many|volume|count|number of (transactions|payments|attempts)|attempts", q):
             metric = "attempts"
-        elif re.search(r"approval rate|conversion|\brate\b|performance|performing|doing", q):
-            return Plan(intent="clarify", clarification={
-                "question": "Which measure do you mean? 'Success rate' can use two denominators.",
-                "options": ["Success rate (successful / all attempts, incl. pending)",
-                            "Success rate excluding pending (successful / successful + failed)",
-                            "Failure rate", "GMV (successful amount)"]})
+        elif metric_ambiguity(question):
+            return metric_ambiguity(question)
 
         # intent
         if any(w in q for w in SOURCE_WORDS):

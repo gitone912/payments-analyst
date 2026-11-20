@@ -21,7 +21,7 @@ from .guard import SqlGuard, UnsafeQuery
 from .llm import LLMCall, LLMPlanner
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
-from .rule_planner import RulePlanner
+from .rule_planner import RulePlanner, metric_ambiguity
 from .semantic import DIMENSIONS, METRICS
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
@@ -120,6 +120,12 @@ class AnalystEngine:
                 ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model})"
                 ans.steps.append(Step("plan", "ok", f"{ans.planner_used}, {len(res.calls)} call(s)",
                                       (time.perf_counter() - t0) * 1000))
+                amb = metric_ambiguity(question)
+                if amb is not None and res.plan.intent != "clarify":
+                    ans.steps.append(Step("ambiguity_guard", "override",
+                                          f"LLM chose metric '{res.plan.metric}' but the question names no "
+                                          "measure; asking instead of guessing"))
+                    return amb
                 return res.plan
             reason = "; ".join(res.errors) or "no plan"
             if mode == "llm":
@@ -433,9 +439,14 @@ class AnalystEngine:
         # confidence
         reasons = [f"Overall change is significant (CI excludes 0, n = {na + nb:,.0f})."]
         level = "high"
-        if any(c.startswith("Data quality (missing data)") for c in ans.caveats):
-            level = "medium"
-            reasons.append("An incomplete day falls inside the analysis window.")
+        gaps = [f for f in self.dq if f.check == "missing_data" and f.status != "pass"]
+        for nm, win in (("baseline", b), ("current", w)):
+            days = sorted({pd.Timestamp(x).date() for f in gaps for x in f.affected_days
+                           if win.start <= pd.Timestamp(x).date() <= win.end})
+            if days:
+                level = "medium"
+                reasons.append(f"Incomplete data on {', '.join(f'{x:%d %b}' for x in days)} falls in the "
+                               f"{nm} period, so that period's {m.label.lower()} carries a time-of-day bias.")
         if any("missing bank" in c for c in ans.caveats):
             reasons.append("Some bank_id values missing in window (small).")
         reasons.append("Driver attribution is descriptive (decomposition), not causal; causes are hypotheses.")

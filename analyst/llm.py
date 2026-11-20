@@ -7,13 +7,14 @@ semantic catalog, or - for questions the catalog can't express - a single SELECT
 never computes numbers and never writes the narrative; numbers come from executed SQL.
 
 Providers (stdlib only, no SDKs):
-  LLM_PROVIDER=gemini  GEMINI_API_KEY=...  LLM_MODEL=gemini-2.0-flash
+  LLM_PROVIDER=gemini  GEMINI_API_KEY=...  LLM_MODEL=gemini-3.5-flash-lite
   LLM_PROVIDER=openai  OPENAI_API_KEY=...  LLM_MODEL=gpt-4o-mini  [OPENAI_BASE_URL=...]
       (any OpenAI-compatible endpoint: Groq, OpenRouter, Ollama, vLLM ...)
   LLM_PROVIDER=none    -> rule planner only
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -27,7 +28,8 @@ from .plan import Plan, Window, validate_plan
 from .semantic import catalog_text
 
 # rough USD per 1M tokens (input, output) for the cost panel; adjust to your contract
-PRICES = {"gemini-2.0-flash": (0.10, 0.40), "gemini-2.5-flash": (0.30, 2.50),
+PRICES = {"gemini-3.5-flash-lite": (0.10, 0.40), "gemini-3.1-flash-lite": (0.10, 0.40),
+          "gemini-2.5-flash": (0.30, 2.50),
           "gpt-4o-mini": (0.15, 0.60), "default": (0.50, 1.50)}
 
 
@@ -46,6 +48,7 @@ class LLMCall:
     cost_usd: float
     ok: bool
     error: str | None = None
+    cached: bool = False
 
 
 @dataclass
@@ -57,6 +60,7 @@ class LLMResult:
 
 SYSTEM_PROMPT = """You are the planning component of a payments analytics assistant.
 Convert the user's question into ONE JSON object (no prose, no markdown fences).
+You only choose WHAT to compute. The engine runs the SQL, scans segments and writes the answer.
 
 Schema:
 {{
@@ -72,13 +76,52 @@ Schema:
  "assumptions": ["..."]
 }}
 
-Rules:
-- Data covers {start} to {end}. Treat {end} as "today". "Last week" = {lw_start}..{end}; its baseline = the 7 days before.
-- diagnose_change = why did a metric change / what drove it / which segments contributed. Needs window AND baseline.
-- If a change question gives no time period, or the metric/denominator is genuinely ambiguous, return intent "clarify" with 2-4 options. Do not guess.
-- Use only metric, dimension and filter keys in the catalog. Filter values must be real names: banks {banks}; methods UPI, Card, NetBanking, Wallet; categories {cats}.
-- Use "free_sql" ONLY if the catalog cannot express the question; then put one DuckDB SELECT in "sql", using only the logical tables listed (alias the fact table as t is not required).
+Intents (pick exactly one):
+- diagnose_change: WHY a metric rose/fell/changed, what drove it, which segments contributed.
+  Needs window AND baseline. Leave "dimensions" empty: the engine automatically scans every
+  segmentation (method, bank, category, merchant, city tier, bank x method, merchant x method).
+  NEVER ask the user which dimension to diagnose by.
+- breakdown: the value of a metric for a period, optionally split by dimensions. Use it for a
+  single number ("what was the success rate in September" -> dimensions []), for "X by bank",
+  for "for <merchant>" (filter + that dimension), and for comparing segments with each other
+  ("UPI vs Card" -> dimensions ["method"], filters {{"method": ["UPI", "Card"]}}).
+- trend: ONLY when the user asks for a daily/weekly trend or a metric "over time". dimensions [] (day is implied).
+- compare_sources: ONLY for transactions vs settlements (finance) reconciliation: "do settlements
+  agree", "finance numbers differ", "reconcile". Never for comparing segments or periods.
+- free_sql: last resort, ONLY if no other intent can express the question. One DuckDB SELECT in "sql"
+  over the logical tables listed. Never use it when the catalog covers the question.
+- clarify: ONLY when (a) a change/why question gives no time period at all, or (b) the measure is
+  genuinely unclear ("how are we performing", "how are we doing"). Give 2-4 concrete options.
+  A missing dimension is NOT a reason to clarify.
+
+Time rules:
+- Data covers {start} to {end}. Treat {end} as "today".
+- "last week" = {lw_start}..{end}; its baseline = {pw_start}..{pw_end}. For any "last week"
+  question (breakdown too) include that baseline.
+- A calendar month = the whole month, clipped to the data end for the current month
+  (the latest month -> {cur_month_start}..{end}). Baseline for a month = the previous calendar month.
+- If the user names a period outside the data, still return exactly that period (with the year
+  they said); the engine will tell them it has no data. Do not clarify and do not move the period.
+- "raw", "as ingested", "including duplicates" -> use_raw true. Otherwise false.
+
+Other rules:
+- Use only metric, dimension and filter keys in the catalog. Filter values must be real names:
+  banks {banks}; methods UPI, Card, NetBanking, Wallet; categories {cats}; merchants by name.
+- "failures"/"most failures" -> metric failure_rate. Customer / VPA questions -> dimension customer_vpa
+  (access control is handled by the engine; just plan it).
 - Record every interpretation you made in "assumptions".
+
+Examples:
+Q: What drove the rise in failure rate last week?
+{{"intent":"diagnose_change","metric":"failure_rate","dimensions":[],"filters":{{}},"window":{{"start":"{lw_start}","end":"{end}"}},"baseline":{{"start":"{pw_start}","end":"{pw_end}"}},"use_raw":false,"sql":null,"clarification":null,"assumptions":["last week vs the week before"]}}
+Q: What was GMV last month?
+{{"intent":"breakdown","metric":"gmv","dimensions":[],"filters":{{}},"window":{{"start":"{prev_month_start}","end":"{prev_month_end}"}},"baseline":null,"use_raw":false,"sql":null,"clarification":null,"assumptions":[]}}
+Q: Success rate for ShopKart by method last week
+{{"intent":"breakdown","metric":"success_rate","dimensions":["method"],"filters":{{"merchant":["ShopKart"]}},"window":{{"start":"{lw_start}","end":"{end}"}},"baseline":{{"start":"{pw_start}","end":"{pw_end}"}},"use_raw":false,"sql":null,"clarification":null,"assumptions":[]}}
+Q: Do finance settlement numbers match transactions this month?
+{{"intent":"compare_sources","metric":"success_rate","dimensions":[],"filters":{{}},"window":{{"start":"{cur_month_start}","end":"{end}"}},"baseline":null,"use_raw":false,"sql":null,"clarification":null,"assumptions":[]}}
+Q: Why did failure rate go up?
+{{"intent":"clarify","metric":"failure_rate","dimensions":[],"filters":{{}},"window":null,"baseline":null,"use_raw":false,"sql":null,"clarification":{{"question":"Which period should I compare?","options":["Last week vs the week before","October vs September","Last 14 days vs the 14 days before"]}},"assumptions":[]}}
 
 CATALOG
 {catalog}
@@ -97,7 +140,12 @@ def plan_from_json(text: str) -> Plan:
     m = re.search(r"\{.*\}", t, flags=re.S)
     if not m:
         raise ValueError("no JSON object in model output")
-    d = json.loads(m.group(0))
+    raw = m.group(0)
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        # tolerate the commonest model slip (trailing commas); anything else goes back to the model
+        d = json.loads(re.sub(r",\s*([}\]])", r"\1", raw))
     return Plan(
         intent=d.get("intent", ""),
         metric=d.get("metric") or "success_rate",
@@ -116,15 +164,25 @@ class LLMPlanner:
     def __init__(self, data_start: date, data_end: date, banks: list[str], cats: list[str],
                  provider: str | None = None, model: str | None = None, max_attempts: int = 2):
         self.provider = (provider or os.getenv("LLM_PROVIDER", "none")).lower()
-        default_model = {"gemini": "gemini-2.0-flash", "openai": "gpt-4o-mini"}.get(self.provider, "")
+        default_model = {"gemini": "gemini-3.5-flash-lite", "openai": "gpt-4o-mini"}.get(self.provider, "")
         self.model = model or os.getenv("LLM_MODEL", default_model)
         self.max_attempts = max_attempts
         self.data_start, self.data_end = data_start, data_end
         from datetime import timedelta
+        lw_start = data_end - timedelta(days=6)
+        month_start = data_end.replace(day=1)
+        prev_end = month_start - timedelta(days=1)
         self.system = SYSTEM_PROMPT.format(
-            start=data_start, end=data_end, lw_start=data_end - timedelta(days=6),
+            start=data_start, end=data_end, lw_start=lw_start,
+            pw_start=lw_start - timedelta(days=7), pw_end=lw_start - timedelta(days=1),
+            cur_month_start=month_start, prev_month_start=prev_end.replace(day=1), prev_month_end=prev_end,
             banks=", ".join(banks), cats=", ".join(cats), catalog=catalog_text())
         self.simulate_outage = False
+        # successful plans keyed by normalised question: re-asks (UI reruns, evals) cost no quota
+        self._cache: dict[str, Plan] = {}
+        # optional client-side pacing for rate-limited tiers (e.g. Gemini free tier = 15 req/min)
+        self.min_interval_s = float(os.getenv("LLM_MIN_INTERVAL_S", "0"))
+        self._last_call = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -146,16 +204,21 @@ class LLMPlanner:
     def _complete(self, user: str) -> tuple[str, int, int]:
         if self.simulate_outage:
             raise ProviderUnavailable("simulated provider outage (demo toggle)")
+        wait = self.min_interval_s - (time.monotonic() - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call = time.monotonic()
         if self.provider == "gemini":
             key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if not key:
                 raise ProviderUnavailable("GEMINI_API_KEY not set")
+            # key goes in a header, not the URL, so it never lands in logs or tracebacks
             url = (f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}"
-                   f":generateContent?key={key}")
+                   f":generateContent")
             body = {"systemInstruction": {"parts": [{"text": self.system}]},
                     "contents": [{"role": "user", "parts": [{"text": user}]}],
                     "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}}
-            r = self._post(url, body, {"Content-Type": "application/json"})
+            r = self._post(url, body, {"Content-Type": "application/json", "x-goog-api-key": key})
             text = r["candidates"][0]["content"]["parts"][0]["text"]
             u = r.get("usageMetadata", {})
             return text, u.get("promptTokenCount", 0), u.get("candidatesTokenCount", 0)
@@ -175,6 +238,11 @@ class LLMPlanner:
     # ------------------------------------------------------------- planning
     def plan(self, question: str) -> LLMResult:
         res = LLMResult(plan=None)
+        ck = " ".join(question.lower().split())
+        if ck in self._cache and not self.simulate_outage:
+            res.plan = copy.deepcopy(self._cache[ck])
+            res.calls.append(LLMCall(self.provider, self.model, 0, 0.0, 0, 0, 0.0, True, cached=True))
+            return res
         user = f"Question: {question}"
         pin, pout = PRICES.get(self.model, PRICES["default"])
         for attempt in range(1, self.max_attempts + 1):
@@ -202,5 +270,6 @@ class LLMPlanner:
                 continue
             res.calls.append(LLMCall(self.provider, self.model, attempt, ms, ti, to, cost, True))
             res.plan = plan
+            self._cache[ck] = copy.deepcopy(plan)
             return res
         return res

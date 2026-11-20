@@ -59,3 +59,38 @@ def test_provider_outage_returns_without_retry_storm():
     p._complete = boom
     res = p.plan("anything")
     assert res.plan is None and len(res.calls) == 1
+
+
+def test_trailing_comma_json_is_repaired():
+    from analyst.llm import plan_from_json
+    p = plan_from_json('{"intent": "clarify", "clarification": {"question": "q", "options": ["a",],},}')
+    assert p.intent == "clarify" and p.clarification["options"] == ["a"]
+
+
+def test_successful_plan_is_cached():
+    p = _planner()
+    calls = []
+    good = ('{"intent":"breakdown","metric":"success_rate","dimensions":[],"filters":{},'
+            '"window":{"start":"2026-10-19","end":"2026-10-25"},"baseline":null}')
+    p._complete = lambda user: (calls.append(user), (good, 10, 5))[1]
+    assert p.plan("Success rate last week").plan is not None
+    r = p.plan("  success RATE last week ")
+    assert r.plan is not None and len(calls) == 1 and r.calls[0].attempt == 0
+
+
+def test_ambiguity_guard_overrides_llm_guess():
+    """'How are we performing' names no measure: even if the LLM picks one, the engine must clarify."""
+    from analyst.engine import Answer, AnalystEngine
+    from analyst.llm import LLMResult
+    from analyst.plan import Plan, Window
+    db = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
+    if not os.path.exists(db):
+        import pytest
+        pytest.skip("run data/generate_data.py first")
+    eng = AnalystEngine(db)
+    eng.llm.provider = "gemini"
+    guess = Plan(intent="breakdown", metric="success_rate",
+                 window=Window(date(2026, 10, 19), date(2026, 10, 25)))
+    eng.llm.plan = lambda q: LLMResult(plan=guess)
+    plan = eng.make_plan("How are we performing last week?", Answer("q", "r"), "llm")
+    assert plan.intent == "clarify"

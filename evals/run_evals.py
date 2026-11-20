@@ -32,7 +32,10 @@ def pcts(text):
     return [float(x) / 100 for x in re.findall(r"(\d+\.\d+)%", text)]
 
 
-def main(planner: str):
+def main(planner: str, paraphrases: bool = False):
+    if planner in ("llm", "auto"):
+        # free-tier keys allow ~15 requests/min; pace calls so the run measures the model, not the quota
+        os.environ.setdefault("LLM_MIN_INTERVAL_S", "4.5")
     eng = AnalystEngine(DB)
     con = duckdb.connect(DB, read_only=True)
     clean = "raw.transactions_clean"
@@ -132,17 +135,69 @@ def main(planner: str):
         print(f"{'PASS' if ok else 'FAIL'}  {cid:<22} expect {expect}, got {a.status} {a.denial_rule or ''}")
 
     # provider outage mid-workflow -> graceful fallback
+    provider_before = eng.llm.provider
     eng.llm.provider, eng.llm.simulate_outage = "gemini", True
     a = eng.ask("Why did success rate drop last week?", "head_of_payments", "auto")
+    eng.llm.provider, eng.llm.simulate_outage = provider_before, False
     ok = a.status == "answered" and any(s.status == "fallback" for s in a.steps)
     passed += ok
     print(f"{'PASS' if ok else 'FAIL'}  {'provider_outage':<22} falls back to deterministic planner")
 
     print(f"\n{passed}/{total} passed")
+    if paraphrases:
+        run_paraphrases(eng, planner)
     return 0 if passed == total else 1
+
+
+# Held-out rewordings: never used to write the planner prompt. They check the plan shape
+# (intent, metric, dimensions, window), so they measure how well the planner generalises.
+PARAPHRASES = [
+    ("What caused the dip in payment success over the past week?", "answered",
+     dict(intent="diagnose_change", metric="success_rate", window=("2026-10-19", "2026-10-25"))),
+    ("How did Card do compared with NetBanking in September?", "answered",
+     dict(intent="breakdown", dims=["method"], window=("2026-09-01", "2026-09-30"))),
+    ("Give me the daily success rate trend for October", "answered",
+     dict(intent="trend", window=("2026-10-01", "2026-10-25"))),
+    ("GMV by category last week", "answered", dict(intent="breakdown", metric="gmv", dims=["category"])),
+    ("Is the finance team's settlement data consistent with our transaction logs for last week?", "answered",
+     dict(intent="compare_sources")),
+    ("Why is success rate down?", "clarify", dict(intent="clarify")),
+    ("Success rate excluding pending for Coastal Bank last week", "answered",
+     dict(intent="breakdown", metric="success_rate_excl_pending")),
+    ("Why did success rate fall in January 2024?", "clarify", dict()),
+    ("Which merchants had the highest failure rate last week?", "answered",
+     dict(intent="breakdown", metric="failure_rate", dims=["merchant"])),
+    ("Top failure reasons last week", "answered", dict(intent="breakdown", dims=["failure_reason"])),
+]
+
+
+def run_paraphrases(eng, planner):
+    print("\nHeld-out paraphrases (plan shape):")
+    ok_n = 0
+    for q, status, exp in PARAPHRASES:
+        a = eng.ask(q, "head_of_payments", planner)
+        p = a.plan or {}
+        why = []
+        if a.status != status:
+            why.append(f"status {a.status}" + (f" ({a.message[:70]})" if a.status == "error" else ""))
+        if "intent" in exp and p.get("intent") != exp["intent"]:
+            why.append(f"intent {p.get('intent')}")
+        if "metric" in exp and p.get("metric") != exp["metric"]:
+            why.append(f"metric {p.get('metric')}")
+        if "dims" in exp and list(p.get("dimensions") or []) != exp["dims"]:
+            why.append(f"dims {p.get('dimensions')}")
+        if "window" in exp:
+            w = p.get("window") or {}
+            if (w.get("start"), w.get("end")) != exp["window"]:
+                why.append(f"window {w.get('start')}..{w.get('end')}")
+        ok_n += not why
+        print(f"{'PASS' if not why else 'FAIL'}  {q[:60]:<60} {'; '.join(why)}")
+    print(f"{ok_n}/{len(PARAPHRASES)} paraphrases planned correctly")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--planner", default="rules", choices=["rules", "llm", "auto"])
-    sys.exit(main(ap.parse_args().planner))
+    ap.add_argument("--paraphrases", action="store_true", help="also run held-out rewordings")
+    args = ap.parse_args()
+    sys.exit(main(args.planner, args.paraphrases))
