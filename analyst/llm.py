@@ -35,7 +35,48 @@ PRICES = {"gemini-3.5-flash-lite": (0.10, 0.40), "gemini-3.1-flash-lite": (0.10,
 
 
 class ProviderUnavailable(Exception):
-    pass
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after  # seconds the provider asked us to wait, if it said
+
+
+class CircuitBreaker:
+    """Per-model breaker: after `threshold` consecutive provider failures the model is skipped for
+    `cooldown_s`, so users don't each wait for a model that is down. Thread-safe (shared engine)."""
+
+    def __init__(self, threshold: int = 3, cooldown_s: float = 60.0, clock=time.monotonic):
+        self.threshold, self.cooldown_s, self.clock = threshold, cooldown_s, clock
+        self._fails: dict[str, int] = {}
+        self._open_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, model: str) -> bool:
+        with self._lock:
+            return self.clock() >= self._open_until.get(model, 0.0)
+
+    def success(self, model: str) -> None:
+        with self._lock:
+            self._fails[model] = 0
+            self._open_until.pop(model, None)
+
+    def failure(self, model: str) -> None:
+        with self._lock:
+            self._fails[model] = self._fails.get(model, 0) + 1
+            if self._fails[model] >= self.threshold:
+                self._open_until[model] = self.clock() + self.cooldown_s
+                self._fails[model] = 0
+
+
+def _retry_after(headers, body: bytes) -> float | None:
+    """Seconds to wait, from a Retry-After header or Gemini's 'retryDelay' / 'retry in Ns' text."""
+    try:
+        v = headers.get("Retry-After") if headers else None
+        if v:
+            return float(v)
+    except (TypeError, ValueError):
+        pass
+    m = re.search(rb'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"|retry in (\d+(?:\.\d+)?)s', body or b"")
+    return float(m.group(1) or m.group(2)) if m else None
 
 
 @dataclass
@@ -55,6 +96,7 @@ class LLMCall:
 @dataclass
 class LLMResult:
     plan: Plan | None
+    model: str = ""
     calls: list[LLMCall] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -186,6 +228,15 @@ class LLMPlanner:
         self.provider = (provider or os.getenv("LLM_PROVIDER", "none")).lower()
         default_model = {"gemini": "gemini-3.5-flash-lite", "openai": "gpt-4o-mini"}.get(self.provider, "")
         self.model = model or os.getenv("LLM_MODEL", default_model)
+        # Backup models, tried in order when the primary is overloaded or rate-limited
+        default_fallbacks = {"gemini": "gemini-3.1-flash-lite"}.get(self.provider, "")
+        fallbacks = os.getenv("LLM_FALLBACK_MODELS", default_fallbacks)
+        self.models = [self.model] + [m.strip() for m in fallbacks.split(",") if m.strip() and m.strip() != self.model]
+        self.breaker = CircuitBreaker(int(os.getenv("LLM_BREAKER_THRESHOLD", "3")),
+                                      float(os.getenv("LLM_BREAKER_COOLDOWN_S", "60")))
+        self.max_retry_wait_s = float(os.getenv("LLM_MAX_RETRY_WAIT_S", "5"))   # honour short Retry-After only
+        self.request_budget_s = float(os.getenv("LLM_REQUEST_BUDGET_S", "20"))  # whole request, all models
+        self._sleep = time.sleep
         self.max_attempts = max_attempts
         self.data_start, self.data_end = data_start, data_end
         from datetime import timedelta
@@ -216,13 +267,17 @@ class LLMPlanner:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            body = e.read() or b""
             if e.code in (429, 500, 502, 503, 504):
-                raise ProviderUnavailable(f"HTTP {e.code} from provider")
-            raise RuntimeError(f"HTTP {e.code}: {e.read()[:200]!r}")
+                raise ProviderUnavailable(f"HTTP {e.code} from provider", _retry_after(e.headers, body))
+            if e.code == 404:  # retired / unknown model: treat as unavailable so the next model is tried
+                raise ProviderUnavailable(f"HTTP 404 (model not available) from provider")
+            raise RuntimeError(f"HTTP {e.code}: {body[:200]!r}")
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise ProviderUnavailable(f"network error: {e}")
 
-    def _complete(self, user: str, simulate_outage: bool = False) -> tuple[str, int, int]:
+    def _complete(self, user: str, simulate_outage: bool = False, model: str | None = None) -> tuple[str, int, int]:
+        model = model or self.model
         if simulate_outage or self.simulate_outage:
             raise ProviderUnavailable("simulated provider outage (demo toggle)")
         if self.min_interval_s > 0:
@@ -236,7 +291,7 @@ class LLMPlanner:
             if not key:
                 raise ProviderUnavailable("GEMINI_API_KEY not set")
             # key goes in a header, not the URL, so it never lands in logs or tracebacks
-            url = (f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}"
+            url = (f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
                    f":generateContent")
             body = {"systemInstruction": {"parts": [{"text": self.system}]},
                     "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -248,7 +303,7 @@ class LLMPlanner:
         if self.provider == "openai":
             key = os.getenv("OPENAI_API_KEY", "")
             base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-            body = {"model": self.model, "temperature": 0,
+            body = {"model": model, "temperature": 0,
                     "response_format": {"type": "json_object"},
                     "messages": [{"role": "system", "content": self.system},
                                  {"role": "user", "content": user}]}
@@ -257,6 +312,43 @@ class LLMPlanner:
             u = r.get("usage", {})
             return r["choices"][0]["message"]["content"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
         raise ProviderUnavailable("no LLM provider configured")
+
+    def _resilient_complete(self, user: str, outage: bool, res: "LLMResult", attempt: int):
+        """One logical completion: primary model, then backups. Each model gets at most two calls
+        (the second only after a short provider-requested wait), models whose breaker is open are
+        skipped, and the whole thing stays inside request_budget_s. Raises ProviderUnavailable when
+        every model failed, so the engine can fall back to the deterministic planner."""
+        if outage or self.simulate_outage:
+            res.calls.append(LLMCall(self.provider, self.model, attempt, 0.0, 0, 0, 0.0, False,
+                                     "simulated provider outage (demo toggle)"))
+            raise ProviderUnavailable("simulated provider outage (demo toggle)")
+        deadline = time.monotonic() + self.request_budget_s
+        errors = []
+        for model in self.models:
+            if not self.breaker.allow(model):
+                errors.append(f"{model}: skipped (circuit open after repeated failures)")
+                continue
+            for tryno in (1, 2):
+                if time.monotonic() >= deadline:
+                    errors.append("request time budget exhausted")
+                    raise ProviderUnavailable("; ".join(errors))
+                t0 = time.perf_counter()
+                try:
+                    text, ti, to = self._complete(user, False, model)
+                except ProviderUnavailable as e:
+                    ms = (time.perf_counter() - t0) * 1000
+                    self.breaker.failure(model)
+                    res.calls.append(LLMCall(self.provider, model, attempt, ms, 0, 0, 0.0, False, str(e)))
+                    errors.append(f"{model}: {e}")
+                    wait = e.retry_after
+                    if (tryno == 1 and wait is not None and wait <= self.max_retry_wait_s
+                            and time.monotonic() + wait < deadline and self.breaker.allow(model)):
+                        self._sleep(wait)  # provider told us how long; it's short, so wait and retry
+                        continue
+                    break  # no usable wait hint: move on to the next model
+                self.breaker.success(model)
+                return text, ti, to, model, (time.perf_counter() - t0) * 1000
+        raise ProviderUnavailable("; ".join(errors) or "no model available")
 
     # ------------------------------------------------------------- planning
     def plan(self, question: str, feedback: str | None = None, context: str | None = None,
@@ -268,20 +360,17 @@ class LLMPlanner:
         if ck in self._cache and not outage:
             res.plan = copy.deepcopy(self._cache[ck])
             res.calls.append(LLMCall(self.provider, self.model, 0, 0.0, 0, 0, 0.0, True, cached=True))
+            res.model = self.model
             return res
         user = ((f"{context}\n\n" if context else "") + f"Question: {question}"
                 + (f"\n\n{feedback}" if feedback else ""))
-        pin, pout = PRICES.get(self.model, PRICES["default"])
         for attempt in range(1, self.max_attempts + 1):
-            t0 = time.perf_counter()
             try:
-                text, ti, to = self._complete(user, outage)
+                text, ti, to, model, ms = self._resilient_complete(user, outage, res, attempt)
             except ProviderUnavailable as e:
-                ms = (time.perf_counter() - t0) * 1000
-                res.calls.append(LLMCall(self.provider, self.model, attempt, ms, 0, 0, 0.0, False, str(e)))
                 res.errors.append(f"provider unavailable: {e}")
-                return res  # don't hammer a dead provider; caller falls back
-            ms = (time.perf_counter() - t0) * 1000
+                return res  # every model failed within the budget; caller falls back to rules
+            pin, pout = PRICES.get(model, PRICES["default"])
             cost = ti / 1e6 * pin + to / 1e6 * pout
             try:
                 plan = plan_from_json(text)
@@ -289,14 +378,15 @@ class LLMPlanner:
                 if problems:
                     raise ValueError("; ".join(problems))
             except Exception as e:  # noqa: BLE001  malformed / unsupported output
-                res.calls.append(LLMCall(self.provider, self.model, attempt, ms, ti, to, cost, False,
+                res.calls.append(LLMCall(self.provider, model, attempt, ms, ti, to, cost, False,
                                          f"invalid plan: {e}"))
                 res.errors.append(f"attempt {attempt}: invalid plan ({e})")
                 user = ((f"{context}\n\n" if context else "") + f"Question: {question}\n\n"
                         f"Your previous output was rejected: {e}.\nReturn a corrected JSON object only.")
                 continue
-            res.calls.append(LLMCall(self.provider, self.model, attempt, ms, ti, to, cost, True))
+            res.calls.append(LLMCall(self.provider, model, attempt, ms, ti, to, cost, True))
             res.plan = plan
+            res.model = model
             self._cache[ck] = copy.deepcopy(plan)
             return res
         return res

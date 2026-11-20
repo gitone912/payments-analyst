@@ -236,7 +236,7 @@ class AnalystEngine:
                 context=ans.llm_context, simulate_outage=ans.simulate_outage)
             ans.llm_calls.extend(res.calls)
             if res.plan is not None and res.plan.intent in ("free_sql", "clarify"):
-                ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model}) - free SQL"
+                ans.planner_used = f"LLM ({self.llm.provider}:{res.model or self.llm.model}) - free SQL"
                 ans.steps.append(Step("coverage_guard", "rerouted",
                                       f"re-planned as {res.plan.intent} so every condition is applied"))
                 return res.plan
@@ -280,7 +280,10 @@ class AnalystEngine:
             res = self.llm.plan(question, context=ans.llm_context, simulate_outage=ans.simulate_outage)
             ans.llm_calls.extend(res.calls)
             if res.plan is not None:
-                ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model})"
+                ans.planner_used = f"LLM ({self.llm.provider}:{res.model or self.llm.model})"
+                if res.model and res.model != self.llm.model:
+                    ans.steps.append(Step("llm_fallback", "ok", f"primary model {self.llm.model} unavailable; "
+                                          f"answered by backup model {res.model}"))
                 ans.steps.append(Step("plan", "ok", f"{ans.planner_used}, {len(res.calls)} call(s)",
                                       (time.perf_counter() - t0) * 1000))
                 amb = metric_ambiguity(question) if ans.prev_plan is None else None

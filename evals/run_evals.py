@@ -6,8 +6,8 @@ engine's compiler), then compared with what the engine answers. Also checks beha
 clarification, access denials, guard blocks and planted-driver detection.
 
     python evals/run_evals.py            # deterministic planner
-    Exit codes: 0 all passed, 1 at least one wrong answer, 3 only model-provider errors remain
-    (after EVAL_PROVIDER_RETRIES retries with EVAL_PROVIDER_BACKOFF_S backoff).
+    Exit codes: 0 all passed, 1 at least one wrong answer, 3 only model-provider errors remain.
+    --save writes evals/results/<planner>.json; evals/render_results.py builds the README table from it.
     LLM_PROVIDER=gemini GEMINI_API_KEY=... python evals/run_evals.py --planner llm
 """
 from __future__ import annotations
@@ -28,23 +28,25 @@ from analyst.engine import AnalystEngine  # noqa: E402
 DB = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
 
 
-PROVIDER_RETRIES = int(os.getenv("EVAL_PROVIDER_RETRIES", "2"))
-PROVIDER_BACKOFF_S = float(os.getenv("EVAL_PROVIDER_BACKOFF_S", "20"))
-
-
 def is_provider_error(a) -> bool:
     return a.status == "error" and "provider unavailable" in a.message
 
 
-def ask_retrying(eng, *args, **kwargs):
-    """Model providers return transient 429/503s. The eval measures answers, not provider uptime, so a
-    provider error is retried after a backoff; only one that persists is reported (as PROVIDER)."""
+RECORDS: list[dict] = []
+MODELS_USED: dict[str, int] = {}
+
+
+def record(cid: str, tag: str, desc: str) -> None:
+    RECORDS.append({"id": cid, "result": tag, "description": desc})
+
+
+def ask(eng, *args, **kwargs):
+    """No retries here: provider resilience (backup models, retry-after, circuit breaker) is the
+    app's job, so the eval measures what a user would actually get."""
     a = eng.ask(*args, **kwargs)
-    for attempt in range(PROVIDER_RETRIES):
-        if not is_provider_error(a):
-            break
-        time.sleep(PROVIDER_BACKOFF_S * (attempt + 1))
-        a = eng.ask(*args, **kwargs)
+    for c in a.llm_calls:
+        if c.ok and not c.cached:
+            MODELS_USED[c.model] = MODELS_USED.get(c.model, 0) + 1
     return a
 
 
@@ -56,7 +58,7 @@ def pcts(text):
     return [float(x) / 100 for x in re.findall(r"(\d+\.\d+)%", text)]
 
 
-def main(planner: str, paraphrases: bool = False):
+def main(planner: str, paraphrases: bool = False, save: bool = False):
     if planner in ("llm", "auto"):
         # free-tier keys allow ~15 requests/min; pace calls so the run measures the model, not the quota
         os.environ.setdefault("LLM_MIN_INTERVAL_S", "4.5")
@@ -214,7 +216,7 @@ def main(planner: str, paraphrases: bool = False):
     total = len(cases) + len(sql_cases) + 1
     cache = {}
     for cid, q, role, check, desc in cases:
-        a = cache.get((q, role)) or ask_retrying(eng, q, role, planner)
+        a = cache.get((q, role)) or ask(eng, q, role, planner)
         if not is_provider_error(a):
             cache[(q, role)] = a
         try:
@@ -227,6 +229,7 @@ def main(planner: str, paraphrases: bool = False):
         provider_errs += (not ok) and provider_err
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}" + ("  [model provider error, not a wrong answer]" if tag == "PROVIDER" else ""))
+        record(cid, tag, desc)
     followups = [
         ("followup_breakdown", "Why did success rate drop last week?", "Now break that down by bank",
          lambda a: a.status == "answered" and abs(a.tables[next(iter(a.tables))].set_index("bank")
@@ -238,8 +241,8 @@ def main(planner: str, paraphrases: bool = False):
     ]
     total += len(followups)
     for cid, q1, q2, check, desc in followups:
-        first = cache.get((q1, "head_of_payments")) or ask_retrying(eng, q1, "head_of_payments", planner)
-        a = ask_retrying(eng, q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
+        first = cache.get((q1, "head_of_payments")) or ask(eng, q1, "head_of_payments", planner)
+        a = ask(eng, q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
         try:
             ok = bool(check(a))
         except Exception as e:  # noqa: BLE001
@@ -250,11 +253,13 @@ def main(planner: str, paraphrases: bool = False):
         provider_errs += (not ok) and provider_err
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}")
+        record(cid, tag, desc)
     for cid, sql, expect in sql_cases:
         a = eng.run_sql(sql, "head_of_payments")
         ok = a.status == expect
         passed += ok
         print(f"{'PASS' if ok else 'FAIL'}  {cid:<22} expect {expect}, got {a.status} {a.denial_rule or ''}")
+        record(cid, "PASS" if ok else "FAIL", f"SQL guard: expect {expect}")
 
     # provider outage mid-workflow -> graceful fallback
     provider_before = eng.llm.provider
@@ -264,11 +269,13 @@ def main(planner: str, paraphrases: bool = False):
     ok = a.status == "answered" and any(s.status == "fallback" for s in a.steps)
     passed += ok
     print(f"{'PASS' if ok else 'FAIL'}  {'provider_outage':<22} falls back to deterministic planner")
+    record("provider_outage", "PASS" if ok else "FAIL", "falls back to deterministic planner")
 
     print(f"\n{passed}/{total} passed" + (f" ({provider_errs} not passed due to model-provider errors)"
                                          if provider_errs else ""))
-    if paraphrases:
-        run_paraphrases(eng, planner)
+    para = run_paraphrases(eng, planner) if paraphrases else None
+    if save:
+        save_results(planner, eng, passed, total, provider_errs, para)
     if passed == total:
         return 0
     if passed + provider_errs == total:
@@ -301,9 +308,9 @@ PARAPHRASES = [
 
 def run_paraphrases(eng, planner):
     print("\nHeld-out paraphrases (plan shape):")
-    ok_n = 0
+    ok_n, rows = 0, []
     for q, status, exp in PARAPHRASES:
-        a = ask_retrying(eng, q, "head_of_payments", planner)
+        a = ask(eng, q, "head_of_payments", planner)
         p = a.plan or {}
         why = []
         if a.status != status:
@@ -319,13 +326,47 @@ def run_paraphrases(eng, planner):
             if (w.get("start"), w.get("end")) != exp["window"]:
                 why.append(f"window {w.get('start')}..{w.get('end')}")
         ok_n += not why
-        print(f"{'PASS' if not why else 'FAIL'}  {q[:60]:<60} {'; '.join(why)}")
+        tag = "PASS" if not why else ("PROVIDER" if is_provider_error(a) else "FAIL")
+        print(f"{tag if tag != 'PROVIDER' else 'FAIL'}  {q[:60]:<60} {'; '.join(why)}")
+        rows.append({"question": q, "result": tag, "detail": "; ".join(why)})
     print(f"{ok_n}/{len(PARAPHRASES)} paraphrases planned correctly")
+    return {"passed": ok_n, "total": len(PARAPHRASES),
+            "provider_errors": sum(r["result"] == "PROVIDER" for r in rows), "cases": rows}
+
+
+def save_results(planner, eng, passed, total, provider_errs, para) -> None:
+    import subprocess
+    from datetime import datetime, timezone
+    try:
+        here = os.path.dirname(__file__)
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                                cwd=here).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", "analyst", "evals/run_evals.py", "data"],
+                               capture_output=True, text=True, cwd=os.path.join(here, "..")).stdout.strip()
+        commit += "-dirty" if commit and dirty else ""
+    except OSError:
+        commit = ""
+    out = {
+        "planner": planner,
+        "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "commit": commit,
+        "llm": {"provider": eng.llm.provider, "models": eng.llm.models,
+                "answered_by": MODELS_USED} if planner != "rules" else None,
+        "core": {"passed": passed, "total": total, "provider_errors": provider_errs,
+                 "wrong": total - passed - provider_errs, "cases": RECORDS},
+        "paraphrases": para,
+    }
+    path = os.path.join(os.path.dirname(__file__), "results", f"{planner}.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+    print(f"saved {os.path.relpath(path)}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--planner", default="rules", choices=["rules", "llm", "auto"])
     ap.add_argument("--paraphrases", action="store_true", help="also run held-out rewordings")
+    ap.add_argument("--save", action="store_true", help="write evals/results/<planner>.json")
     args = ap.parse_args()
-    sys.exit(main(args.planner, args.paraphrases))
+    sys.exit(main(args.planner, args.paraphrases, args.save))

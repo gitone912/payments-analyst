@@ -52,13 +52,99 @@ def test_unsupported_metric_rejected_then_gives_up():
 
 
 def test_provider_outage_returns_without_retry_storm():
+    """Every model down: one call per model (no wait hint -> no retry), then give up so the engine
+    falls back to the deterministic planner."""
     p = _planner()
+    p.models = ["primary", "backup"]
+    tried = []
 
-    def boom(user, *_):
+    def boom(user, outage=False, model=None):
+        tried.append(model)
         raise ProviderUnavailable("HTTP 503 from provider")
     p._complete = boom
     res = p.plan("anything")
-    assert res.plan is None and len(res.calls) == 1
+    assert res.plan is None and tried == ["primary", "backup"] and len(res.calls) == 2
+
+
+GOOD_PLAN = ('{"intent":"breakdown","metric":"success_rate","dimensions":[],"filters":{},'
+             '"window":{"start":"2026-10-19","end":"2026-10-25"},"baseline":null}')
+
+
+def test_backup_model_answers_when_primary_is_overloaded():
+    p = _planner()
+    p.models = ["primary", "backup"]
+
+    def complete(user, outage=False, model=None):
+        if model == "primary":
+            raise ProviderUnavailable("HTTP 503 from provider")
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    res = p.plan("Success rate last week")
+    assert res.plan is not None and res.model == "backup"
+    assert [c.model for c in res.calls] == ["primary", "backup"]
+
+
+def test_short_retry_after_is_honoured_then_same_model_retried():
+    p = _planner()
+    p.models = ["primary", "backup"]
+    slept, calls = [], []
+    p._sleep = slept.append
+
+    def complete(user, outage=False, model=None):
+        calls.append(model)
+        if len(calls) == 1:
+            raise ProviderUnavailable("HTTP 429 from provider", retry_after=2.0)
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    res = p.plan("Success rate last week")
+    assert slept == [2.0] and calls == ["primary", "primary"] and res.model == "primary"
+
+
+def test_long_retry_after_is_not_waited_for():
+    p = _planner()
+    p.models = ["primary", "backup"]
+    slept = []
+    p._sleep = slept.append
+
+    def complete(user, outage=False, model=None):
+        if model == "primary":
+            raise ProviderUnavailable("HTTP 429 from provider", retry_after=37.0)  # too long for a user
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    assert p.plan("Success rate last week").model == "backup" and slept == []
+
+
+def test_circuit_breaker_skips_a_failing_model_then_recovers():
+    from analyst.llm import CircuitBreaker
+    now = [0.0]
+    p = _planner()
+    p.models = ["primary", "backup"]
+    p.breaker = CircuitBreaker(threshold=3, cooldown_s=60, clock=lambda: now[0])
+    calls = []
+
+    def complete(user, outage=False, model=None):
+        calls.append(model)
+        if model == "primary":
+            raise ProviderUnavailable("HTTP 503 from provider")
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    for i in range(3):                       # three failures open the breaker for 'primary'
+        p.plan(f"Success rate last week {i}")
+    calls.clear()
+    p.plan("Success rate last week again")
+    assert calls == ["backup"]               # primary skipped while open
+    now[0] = 61.0                            # after the cooldown it is tried again
+    calls.clear()
+    p.plan("Success rate last week later")
+    assert calls[0] == "primary"
+
+
+def test_retry_after_parsed_from_gemini_body():
+    from analyst.llm import _retry_after
+    assert _retry_after({}, b'{"details":[{"retryDelay":"36s"}]}') == 36.0
+    assert _retry_after({}, b"Please retry in 4.5s.") == 4.5
+    assert _retry_after({"Retry-After": "7"}, b"") == 7.0
+    assert _retry_after({}, b"overloaded") is None
 
 
 def test_trailing_comma_json_is_repaired():
