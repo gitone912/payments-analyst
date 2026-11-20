@@ -94,3 +94,19 @@ def test_ambiguity_guard_overrides_llm_guess():
     eng.llm.plan = lambda q: LLMResult(plan=guess)
     plan = eng.make_plan("How are we performing last week?", Answer("q", "r"), "llm")
     assert plan.intent == "clarify"
+
+
+def test_unmodelled_conditions_detector():
+    from analyst.rule_planner import unmodelled_conditions as u
+    assert u("What share of transactions are above 5000 INR last week?")
+    assert u("failed UPI txns over ₹2,000") and u("amount > 10k") and u("median ticket size")
+    # time phrases are not conditions the catalog misses
+    for q in ("Success rate over the past week", "last 14 days", "more than 2 weeks ago", "Success rate by bank"):
+        assert not u(q), q
+
+
+def test_premise_direction():
+    from analyst.rule_planner import premise_direction as d
+    assert d("Why did GMV drop last week?") == "down"
+    assert d("Why did failure rate go up?") == "up"
+    assert d("What drove the change?") is None

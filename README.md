@@ -19,8 +19,8 @@ each kept separate.
 pip install -r requirements.txt
 python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
 streamlit run app.py                    # UI at http://localhost:8501
-python evals/run_evals.py               # 27 known-answer / safety checks
-python -m pytest -q tests               # 7 unit tests
+python evals/run_evals.py               # 32 known-answer / safety checks
+python -m pytest -q tests               # 9 unit tests
 python cli.py "why did success rate drop last week?" --sql
 ```
 
@@ -91,6 +91,13 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
   The metric-ambiguity check is enforced in code on LLM plans too. If the model quietly picks a
   measure for "how are we performing?", the engine overrides it with a clarification and logs an
   `ambiguity_guard` step.
+- **Never silently drop a condition.** If the question contains something the catalog can't
+  express (an amount threshold, a distinct count, a percentile), a catalog plan would answer a
+  different question with full confidence. A coverage guard detects this (regex detector + the
+  model's own `unsupported` list) and re-plans as model-written SQL, which goes through the same
+  guard, or asks the user. It never answers while ignoring the condition.
+- **Premise check.** "Why did GMV drop?" when GMV rose is answered with
+  "Premise check: ... it actually rose" before the numbers.
 - **LLM robustness**: tolerant JSON parsing (trailing commas), one retry with the validation
   errors fed back, no retry on 429/5xx (falls back immediately), and an in-process plan cache so
   re-asking a question costs no quota.

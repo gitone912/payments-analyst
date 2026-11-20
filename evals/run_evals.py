@@ -52,6 +52,25 @@ def main(planner: str, paraphrases: bool = False):
     T_SEP = sr(clean, "2026-09-01", "2026-09-30")
     T_DELTA_LW = sr(clean, "2026-10-19", "2026-10-25", "|AND t.bank_id='B04'")
 
+    T_SHARE_5K = truth(con, f"""SELECT AVG((amount_inr > 5000)::INT) FROM {clean}
+        WHERE created_at >= DATE '2026-10-19' AND created_at < DATE '2026-10-26'""")
+    T_UPI_FAIL_2K = truth(con, f"""SELECT COUNT(*) FROM {clean} WHERE method_id = 'UPI' AND status = 'FAILED'
+        AND amount_inr > 2000 AND created_at >= DATE '2026-10-01' AND created_at < DATE '2026-11-01'""")
+
+    def result_has(a, target, tol):
+        """Any numeric cell in the first row of a free-SQL result equals target (shares also as %)."""
+        df = a.tables.get("Result")
+        if df is None or not len(df):
+            return False
+        vals = [float(v) for v in df.iloc[0].tolist() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return any(abs(v - target) <= tol or abs(v / 100 - target) <= tol for v in vals)
+
+    def custom_condition(a, target, tol, needle):
+        # without an LLM the engine must refuse to drop the condition; with one, the SQL must be right
+        if planner == "rules":
+            return a.status == "clarify" and needle in a.message
+        return a.status == "answered" and (a.plan or {}).get("intent") == "free_sql" and result_has(a, target, tol)
+
     def close(xs, target, tol=0.0002):
         return any(abs(x - target) <= tol for x in xs)
 
@@ -104,6 +123,20 @@ def main(planner: str, paraphrases: bool = False):
         ("sources_disagree", "Do settlements agree with transactions on success rate last week?",
          "head_of_payments", lambda a: "disagree" in a.headline and any("PENDING" in h for h in a.hypotheses),
          "explains source disagreement"),
+        ("custom_sql_share", "What share of transactions were above 5000 INR last week?", "head_of_payments",
+         lambda a: custom_condition(a, T_SHARE_5K, 2e-4, "5000"),
+         f"amount threshold applied, not dropped (share {T_SHARE_5K:.2%})"),
+        ("custom_sql_count", "How many failed UPI transactions over 2000 INR were there in October?",
+         "head_of_payments", lambda a: custom_condition(a, T_UPI_FAIL_2K, 0.5, "2000"),
+         f"amount threshold applied, not dropped (count {T_UPI_FAIL_2K:,})"),
+        ("premise_check", "Why did GMV drop last week?", "head_of_payments",
+         lambda a: a.status == "answered" and "actually rose" in a.headline,
+         "corrects a false premise (GMV rose)"),
+        ("action_question", "What action should we take on success rate last week?", "head_of_payments",
+         lambda a: a.status == "answered" and len(a.recommendations) >= 2, "returns recommendations"),
+        ("hour_labels", "Success rate by hour of day last week", "head_of_payments",
+         lambda a: a.status == "answered" and str(a.tables[next(iter(a.tables))].iloc[0, 0]) == "00:00",
+         "hours shown as HH:00"),
     ]
     sql_cases = [
         ("guard_delete", "DELETE FROM transactions", "blocked"),
@@ -116,6 +149,7 @@ def main(planner: str, paraphrases: bool = False):
     ]
 
     passed = 0
+    provider_errs = 0
     total = len(cases) + len(sql_cases) + 1
     cache = {}
     for cid, q, role, check, desc in cases:
@@ -127,7 +161,10 @@ def main(planner: str, paraphrases: bool = False):
             ok = False
             desc += f" [check error: {e}]"
         passed += ok
-        print(f"{'PASS' if ok else 'FAIL'}  {cid:<22} {desc}")
+        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_errs += (not ok) and provider_err
+        tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
+        print(f"{tag:<8}  {cid:<22} {desc}" + ("  [model provider error, not a wrong answer]" if tag == "PROVIDER" else ""))
     for cid, sql, expect in sql_cases:
         a = eng.run_sql(sql, "head_of_payments")
         ok = a.status == expect
@@ -143,7 +180,8 @@ def main(planner: str, paraphrases: bool = False):
     passed += ok
     print(f"{'PASS' if ok else 'FAIL'}  {'provider_outage':<22} falls back to deterministic planner")
 
-    print(f"\n{passed}/{total} passed")
+    print(f"\n{passed}/{total} passed" + (f" ({provider_errs} not passed due to model-provider errors)"
+                                         if provider_errs else ""))
     if paraphrases:
         run_paraphrases(eng, planner)
     return 0 if passed == total else 1

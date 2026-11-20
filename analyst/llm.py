@@ -73,14 +73,17 @@ Schema:
  "use_raw": false,
  "sql": null,
  "clarification": null | {{"question": "...", "options": ["...", "..."]}},
- "assumptions": ["..."]
+ "assumptions": ["..."],
+ "unsupported": ["..."]
 }}
 
 Intents (pick exactly one):
 - diagnose_change: WHY a metric rose/fell/changed, what drove it, which segments contributed.
   Needs window AND baseline. Leave "dimensions" empty: the engine automatically scans every
   segmentation (method, bank, category, merchant, city tier, bank x method, merchant x method).
-  NEVER ask the user which dimension to diagnose by.
+  NEVER ask the user which dimension to diagnose by. Also use diagnose_change when the user asks
+  what to do / which actions or next steps for a metric over a period: recommendations come out of
+  the diagnosis, so do not clarify.
 - breakdown: the value of a metric for a period, optionally split by dimensions. Use it for a
   single number ("what was the success rate in September" -> dimensions []), for "X by bank",
   for "for <merchant>" (filter + that dimension), and for comparing segments with each other
@@ -88,8 +91,12 @@ Intents (pick exactly one):
 - trend: ONLY when the user asks for a daily/weekly trend or a metric "over time". dimensions [] (day is implied).
 - compare_sources: ONLY for transactions vs settlements (finance) reconciliation: "do settlements
   agree", "finance numbers differ", "reconcile". Never for comparing segments or periods.
-- free_sql: last resort, ONLY if no other intent can express the question. One DuckDB SELECT in "sql"
-  over the logical tables listed. Never use it when the catalog covers the question.
+- free_sql: ONLY if no other intent can express the question, e.g. it has a condition the catalog
+  cannot apply (amount thresholds like "above 5000 INR", distinct counts, percentiles). Write one
+  DuckDB SELECT in "sql" over the logical tables listed, apply EVERY condition in the question
+  (including the time window on created_at), and give result columns clear names
+  (e.g. share_above_5000, txn_count). Express shares as a fraction between 0 and 1.
+  Never select customer_vpa unless the question asks for customers.
 - clarify: ONLY when (a) a change/why question gives no time period at all, or (b) the measure is
   genuinely unclear ("how are we performing", "how are we doing"). Give 2-4 concrete options.
   A missing dimension is NOT a reason to clarify.
@@ -110,6 +117,8 @@ Other rules:
 - "failures"/"most failures" -> metric failure_rate. Customer / VPA questions -> dimension customer_vpa
   (access control is handled by the engine; just plan it).
 - Record every interpretation you made in "assumptions".
+- "unsupported": list every condition in the question that your plan does NOT apply. A catalog intent
+  with a non-empty "unsupported" list is wrong: use free_sql (or clarify) instead. Normally [].
 
 Examples:
 Q: What drove the rise in failure rate last week?
@@ -157,6 +166,7 @@ def plan_from_json(text: str) -> Plan:
         sql=d.get("sql"),
         clarification=d.get("clarification"),
         assumptions=list(d.get("assumptions") or []),
+        unsupported=[str(x) for x in (d.get("unsupported") or [])],
     )
 
 
@@ -236,14 +246,14 @@ class LLMPlanner:
         raise ProviderUnavailable("no LLM provider configured")
 
     # ------------------------------------------------------------- planning
-    def plan(self, question: str) -> LLMResult:
+    def plan(self, question: str, feedback: str | None = None) -> LLMResult:
         res = LLMResult(plan=None)
-        ck = " ".join(question.lower().split())
+        ck = " ".join(question.lower().split()) + (f" || {feedback}" if feedback else "")
         if ck in self._cache and not self.simulate_outage:
             res.plan = copy.deepcopy(self._cache[ck])
             res.calls.append(LLMCall(self.provider, self.model, 0, 0.0, 0, 0, 0.0, True, cached=True))
             return res
-        user = f"Question: {question}"
+        user = f"Question: {question}" + (f"\n\n{feedback}" if feedback else "")
         pin, pout = PRICES.get(self.model, PRICES["default"])
         for attempt in range(1, self.max_attempts + 1):
             t0 = time.perf_counter()

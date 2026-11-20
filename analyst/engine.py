@@ -7,6 +7,7 @@ query ids that support it. The LLM (if configured) only produces the plan.
 from __future__ import annotations
 
 import copy
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -21,7 +22,7 @@ from .guard import SqlGuard, UnsafeQuery
 from .llm import LLMCall, LLMPlanner
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
-from .rule_planner import RulePlanner, metric_ambiguity
+from .rule_planner import RulePlanner, metric_ambiguity, premise_direction, unmodelled_conditions
 from .semantic import DIMENSIONS, METRICS
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
@@ -112,6 +113,40 @@ class AnalystEngine:
 
     # ------------------------------------------------------------ planning
     def make_plan(self, question: str, ans: Answer, mode: str) -> Plan:
+        plan = self._make_plan(question, ans, mode)
+        return self._coverage_guard(question, plan, ans, mode)
+
+    def _coverage_guard(self, question: str, plan: Plan, ans: Answer, mode: str) -> Plan:
+        """A catalog plan that silently drops a condition ("above 5000 INR") answers a different
+        question with full confidence. Detect that and route to guarded LLM SQL, or ask."""
+        if plan.intent == "free_sql":
+            return plan
+        gaps = list(dict.fromkeys(unmodelled_conditions(question) + list(plan.unsupported)))
+        if not gaps:
+            return plan
+        if plan.intent == "clarify" and ans.planner_used.startswith("LLM"):
+            return plan  # the model already chose to ask
+        ans.steps.append(Step("coverage_guard", "warn",
+                              f"plan '{plan.intent}' cannot apply: {'; '.join(gaps)}"))
+        if mode in ("auto", "llm") and self.llm.enabled and not self.llm.simulate_outage:
+            res = self.llm.plan(question, feedback=(
+                "Your catalog plan cannot apply these conditions from the question: " + "; ".join(gaps)
+                + ". Return intent free_sql with ONE SELECT that applies every condition, or clarify."))
+            ans.llm_calls.extend(res.calls)
+            if res.plan is not None and res.plan.intent in ("free_sql", "clarify"):
+                ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model}) - free SQL"
+                ans.steps.append(Step("coverage_guard", "rerouted",
+                                      f"re-planned as {res.plan.intent} so every condition is applied"))
+                return res.plan
+        ans.steps.append(Step("coverage_guard", "clarify", "no plan applies every condition; asking"))
+        cond = "; ".join(g.split(": ", 1)[-1] for g in gaps)
+        return Plan(intent="clarify", metric=plan.metric, clarification={
+            "question": (f"I can't apply {cond} with the standard metrics, and I won't answer while ignoring it. "
+                         "Enable the LLM planner (it can write a guarded custom query), use the SQL playground, "
+                         "or drop the condition."),
+            "options": []})
+
+    def _make_plan(self, question: str, ans: Answer, mode: str) -> Plan:
         t0 = time.perf_counter()
         if mode in ("auto", "llm") and self.llm.enabled:
             res = self.llm.plan(question)
@@ -266,6 +301,19 @@ class AnalystEngine:
     def _fact(self, ans: Answer, text: str, *recs: QueryRecord) -> None:
         ans.facts.append({"text": text, "evidence": [r.query_id for r in recs]})
 
+    def _premise_check(self, ans: Answer, label: str, delta: float, rec: QueryRecord) -> None:
+        """Say so plainly when the question assumes the wrong direction ("why did GMV drop" when it rose)."""
+        asked = premise_direction(ans.question)
+        actual = "down" if delta < 0 else "up" if delta > 0 else None
+        if asked and actual and asked != actual:
+            said = "dropped" if asked == "down" else "rose"
+            did = "rose" if actual == "up" else "fell"
+            name = label if label[:3].isupper() else label.lower()
+            note = f"Premise check: the question assumes {name} {said}, but it actually {did}."
+            ans.headline = note + " " + ans.headline
+            self._fact(ans, note, rec)
+            ans.steps.append(Step("premise_check", "warn", note))
+
     # ------------------------------------------------------------ diagnose
     def _diagnose(self, plan: Plan, role: Role, ans: Answer) -> None:
         m = METRICS[plan.metric]
@@ -294,6 +342,7 @@ class AnalystEngine:
         direction = "fell" if d < 0 else "rose"
         ans.headline = (f"{m.label} {direction} from {fmt(m.key, ra)} to {fmt(m.key, rb)} "
                         f"({pts(d)}) between {b.label()} and {w.label()}.")
+        self._premise_check(ans, m.label, d, q_head)
         self._fact(ans, ans.headline + f" 95% CI for the change: {pts(lo)} to {pts(hi)}; "
                    f"attempts {na:,.0f} → {nb:,.0f} ({(nb / na - 1):+.0%}).", q_head)
         ans.steps.append(Step("headline", "ok", ans.headline))
@@ -458,7 +507,9 @@ class AnalystEngine:
         va, vb = sa, sb
         if m.key == "attempts":
             va, vb = na, nb
-        ans.headline = f"{m.label} changed from {fmt(m.key, va)} to {fmt(m.key, vb)} ({(vb / va - 1):+.1%})."
+        direction = "fell" if vb < va else "rose"
+        ans.headline = f"{m.label} {direction} from {fmt(m.key, va)} to {fmt(m.key, vb)} ({(vb / va - 1):+.1%})."
+        self._premise_check(ans, m.label, vb - va, q_head)
         self._fact(ans, ans.headline, q_head)
         for dim in ["merchant", "method", "bank"]:
             df, rec = self._run(ans, role, compiler.two_period_segments(plan, [dim]), f"Contribution by {dim}")
@@ -600,7 +651,16 @@ class AnalystEngine:
     def _free_sql(self, plan: Plan, role: Role, ans: Answer) -> None:
         df, rec = self._run(ans, role, plan.sql, "Model-written SQL (validated by guard)")
         ans.tables["Result"] = df
-        ans.headline = f"Query returned {len(df)} row(s)."
+        if len(df) == 1 and 0 < len(df.columns) <= 4:
+            def show(col, v):
+                if isinstance(v, float) and 0 <= v <= 1 and re.search(r"share|rate|pct|ratio|fraction", col):
+                    return f"{v:.2%}"
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    return f"{v:,.2f}" if isinstance(v, float) and v % 1 else f"{v:,.0f}"
+                return str(v)
+            ans.headline = "; ".join(f"{c.replace('_', ' ')} = {show(c, df.iloc[0][c])}" for c in df.columns) + "."
+        else:
+            ans.headline = f"Query returned {len(df)} row(s)."
         self._fact(ans, ans.headline + " Values are shown exactly as returned.", rec)
         ans.caveats.append("This SQL was written by the language model (no catalog plan fitted). It passed the "
                            "safety guard, but check that it answers your question.")

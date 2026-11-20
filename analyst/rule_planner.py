@@ -17,7 +17,8 @@ MONTHS = {m: i for i, m in enumerate(
      "september", "october", "november", "december"], start=1)}
 
 DIAG_WORDS = ("why", "drop", "decline", "declin", "fell", "fall", "dip", "down", "worse",
-              "contribut", "driver", "explain", "cause", "change", "changed", "deteriorat")
+              "contribut", "driver", "explain", "cause", "change", "changed", "deteriorat",
+              "action", "recommend", "next step", "should we do", "what should we")
 TREND_WORDS = ("trend", "over time", "daily", "day by day", "per day", "by day", "each day",
                "weekly", "by week", "time series")
 SOURCE_WORDS = ("settlement", "finance", "reconcil", "two sources", "disagree", "mismatch")
@@ -36,6 +37,49 @@ DIM_PATTERNS = [
 METHOD_ALIASES = {"upi": "UPI", "card": "Card", "cards": "Card", "credit card": "Card",
                   "debit card": "Card", "netbanking": "NetBanking", "net banking": "NetBanking",
                   "nb": "NetBanking", "wallet": "Wallet", "wallets": "Wallet"}
+
+
+_TIME_UNIT = r"(?:days?|weeks?|months?|years?|hours?|mins?|minutes?)"
+_NUM = r"(?:₹|rs\.?\s*|inr\s*)?\d[\d,]*(?:\.\d+)?\s*(?:k|lakh|inr|rupees|rs)?"
+_CONDITION_PATTERNS = [
+    (rf"\b(?:above|over|below|under|more than|less than|greater than|fewer than|at least|at most|"
+     rf"exceeding|bigger than|smaller than)\s+{_NUM}(?!\s*{_TIME_UNIT}\b)", "numeric threshold"),
+    (rf"(?:>=|<=|>|<)\s*{_NUM}", "numeric threshold"),
+    (rf"\bbetween\s+{_NUM}\s+and\s+{_NUM}(?!\s*{_TIME_UNIT}\b)", "numeric range"),
+    (r"\b(?:distinct|unique)\s+\w+", "distinct count"),
+    (r"\b(?:median|percentile|p\d{2})\b", "percentile"),
+    (r"\brepeat (?:customers?|payers?|users?)\b", "repeat-customer logic"),
+]
+
+
+def unmodelled_conditions(question: str) -> list[str]:
+    """Conditions in the question that no catalog plan can apply (amount thresholds, distinct counts,
+    percentiles...). A catalog plan that ignores them would answer a different question with full
+    confidence, so the engine routes these to guarded free SQL or asks the user instead."""
+    q = question.lower()
+    found = []
+    for pat, kind in _CONDITION_PATTERNS:
+        for m in re.finditer(pat, q):
+            txt = m.group(0).strip()
+            if not re.search(r"\d|distinct|unique|median|percentile|repeat", txt):
+                continue
+            found.append(f"{kind}: '{txt}'")
+    return found
+
+
+_DOWN = r"\b(drop\w*|declin\w*|fall\w*|fell|dip\w*|down|decreas\w*|worse\w*|lower\w*|reduc\w*|deteriorat\w*)\b"
+_UP = r"\b(rise|rose|risen|rising|increas\w*|up|improv\w*|grow\w*|grew|higher|jump\w*|spike\w*|went up)\b"
+
+
+def premise_direction(question: str) -> str | None:
+    """'down' / 'up' if the question presupposes a direction of change, else None."""
+    q = question.lower()
+    down, up = bool(re.search(_DOWN, q)), bool(re.search(_UP, q))
+    if down and not up:
+        return "down"
+    if up and not down:
+        return "up"
+    return None
 
 
 METRIC_CLARIFICATION = {
