@@ -166,8 +166,11 @@ Ground truth comes from hand-written SQL on the raw tables, not from the engine'
 | Planner | Core checks passed | Wrong answers | Provider errors | Held-out paraphrases | Run (UTC) · commit |
 |---|---|---|---|---|---|
 | Deterministic rules | 40/40 | 0 | 0 | 8/10 | 2026-11-20 18:35 · `5800da5` |
+| LLM (live) `gemini-3.5-flash-lite` | 39/40 | 0 | 1 | 10/10 | 2026-11-20 18:38 · `f91347e` |
 
 - Deterministic rules paraphrases not passed: "How did Card do compared with NetBanking in September?" (FAIL); "Top failure reasons last week" (FAIL)
+- LLM (live): models tried in order `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`; answers came from `gemini-3.5-flash-lite` ×31, `gemini-3.1-flash-lite` ×1.
+- LLM (live) not passed: `bank_breakdown` (PROVIDER)
 <!-- eval-results:end -->
 
 The core suite includes questions the catalog can't express: amount thresholds, "on weekends",
