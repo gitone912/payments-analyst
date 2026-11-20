@@ -108,15 +108,20 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
 
 Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
 
-| Planner | Core suite (27 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
+| Planner | Core suite (32 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
 |---|---|---|
-| Deterministic rules | 27/27 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
-| Gemini `gemini-3.5-flash-lite` (live) | 27/27 | 8/10. Both misses were HTTP 503 from the provider; every plan the model returned was correct |
+| Deterministic rules | 32/32 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
+| Gemini `gemini-3.5-flash-lite` (live) | 32/32 | 9/10. The miss was HTTP 503 from the provider; every plan the model returned was correct |
+
+The core suite includes two questions the catalog can't express ("share of transactions above
+5000 INR", "failed UPI transactions over 2000 INR"). With the LLM, the model writes SQL that
+matches the hand-written ground truth exactly. Without it, the engine asks instead of answering
+a different question. The eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
 
 The paraphrases were written after the prompt was finalised and are not used as prompt examples.
 They show whether the planner generalises beyond the questions it was tuned against.
-Runs vary slightly even at temperature 0: in one of four live runs the model planned the "raw" question
-as a trend, and the provider sometimes returns 429/503. In `auto` mode those cases fall back
+Runs vary slightly even at temperature 0: in earlier runs the model occasionally chose a
+different plan (e.g. the "raw" question as a trend), and the provider sometimes returns 429/503. In `auto` mode those cases fall back
 to the rule planner, and the fallback is shown in the trace.
 
 ## Failure scenarios covered
