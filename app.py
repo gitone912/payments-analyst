@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from analyst import charts
+from analyst.auth import auth_mode, user_from_headers, verify_password
 from analyst.engine import AnalystEngine
 from analyst.rbac import ROLES
 
@@ -51,18 +52,54 @@ EXAMPLES = [
     "Success rate last week raw including duplicates",
 ]
 
+# ------------------------------------------------------------------ authentication
+# The role comes from the authenticated account, never from a control the user can change.
+def current_user():
+    if auth_mode() == "header":
+        return user_from_headers(st.context.headers)
+    return st.session_state.get("user")
+
+
+user = current_user()
+if user is None:
+    st.title("Payments AI Analyst")
+    if auth_mode() == "header":
+        st.error("Not authenticated: no trusted identity header from the SSO proxy, or this identity has "
+                 "no role assigned. Contact the data platform team.")
+        st.stop()
+    with st.form("login"):
+        st.subheader("Sign in")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.form_submit_button("Sign in", type="primary"):
+            u = verify_password(username, password)
+            if u is None:
+                st.error("Invalid username or password.")
+            else:
+                st.session_state.clear()
+                st.session_state.user = u
+                st.rerun()
+    st.caption("Demo accounts are listed in the README (one per role).")
+    st.stop()
+
+role_key = user.role
+
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.header("Session")
-    role_key = st.selectbox("Signed in as", list(ROLES), format_func=lambda k: ROLES[k].label)
+    st.markdown(f"**{user.display_name}**  \n`{user.username}` · {ROLES[role_key].label}")
     st.caption(ROLES[role_key].description)
+    if auth_mode() != "header" and st.button("Sign out"):
+        st.session_state.clear()
+        st.rerun()
     planner_mode = st.radio("Planner", ["auto", "rules", "llm"], horizontal=True,
                             help="auto = LLM if configured, deterministic planner as fallback")
     if eng.llm.enabled:
         st.success(f"LLM: {eng.llm.provider} / {eng.llm.model}")
     else:
         st.info("LLM: not configured (set LLM_PROVIDER + key). Using deterministic planner.")
-    eng.llm.simulate_outage = st.toggle("Simulate model-provider outage", value=False)
+    # per-session demo switch; passed with each request, never set on the shared engine
+    simulate_outage = st.toggle("Simulate model-provider outage", value=False)
 
     st.divider()
     st.subheader("Data quality")
@@ -197,7 +234,8 @@ with tab_ask:
     if clicked and q.strip():
         with st.spinner("Planning, validating and querying..."):
             context = prev if prev and prev["role"] == role_key else None
-            ans = eng.ask(q, role_key, planner_mode, previous=context)
+            ans = eng.ask(q, role_key, planner_mode, previous=context, user=user.username,
+                          simulate_outage=simulate_outage)
             st.session_state.last = ans
             if ans.status == "answered" and ans.plan:
                 st.session_state.prev = {"question": q, "plan": ans.plan, "role": role_key}
@@ -219,7 +257,7 @@ with tab_sql:
     pick = st.selectbox("Preset", list(presets))
     sql = st.text_area("SQL", presets[pick], height=150)
     if st.button("Run through guard"):
-        st.session_state.sql_ans = eng.run_sql(sql, role_key)
+        st.session_state.sql_ans = eng.run_sql(sql, role_key, user=user.username)
     if "sql_ans" in st.session_state:
         a = st.session_state.sql_ans
         if a.status != "answered":
@@ -231,7 +269,11 @@ with tab_sql:
             st.dataframe(a.tables["Result"], width="stretch", hide_index=True)
 
 with tab_log:
-    st.caption("Every query executed in this server session (audit trail).")
-    if eng.ex.log:
-        st.dataframe(pd.DataFrame([{k: v for k, v in vars(r).items() if k != "executable_sql"}
-                                   for r in eng.ex.log]), width="stretch", hide_index=True)
+    st.caption("Your queries from the persistent audit log (who, role, when, outcome). "
+               "You only see your own; the full log is for platform admins.")
+    rows = eng.ex.read_audit(user=user.username)
+    if rows:
+        st.dataframe(pd.DataFrame(rows[::-1]).drop(columns=["executable_sql"], errors="ignore"),
+                     width="stretch", hide_index=True)
+    else:
+        st.info("No queries yet.")

@@ -35,6 +35,17 @@ TABLE_DOCS = {
 
 PII_COLUMNS = {"customer_vpa"}
 
+# Failure taxonomy. The first question in any payments success-rate review is "technical or
+# business?": technical failures (timeouts, issuer/network downtime) are ours or a partner's to fix;
+# business declines (insufficient funds, customer drop-off, risk/issuer policy) are not.
+TECHNICAL_FAILURE_REASONS = ("TIMEOUT", "BANK_DOWNTIME")
+BUSINESS_DECLINE_REASONS = ("INSUFFICIENT_FUNDS", "USER_DROPPED", "RISK_BLOCKED", "BANK_DECLINED")
+_TECH = "(" + ", ".join(f"'{r}'" for r in TECHNICAL_FAILURE_REASONS) + ")"
+_IS_TECH = f"(t.status = 'FAILED' AND t.failure_reason IN {_TECH})"
+_IS_BUSINESS = f"(t.status = 'FAILED' AND (t.failure_reason IS NULL OR t.failure_reason NOT IN {_TECH}))"
+DECLINE_TYPE_SQL = (f"CASE WHEN t.status = 'SUCCESS' THEN 'success' WHEN t.status = 'PENDING' THEN 'pending' "
+                    f"WHEN {_IS_TECH} THEN 'technical failure' ELSE 'business decline' END")
+
 
 @dataclass(frozen=True)
 class Metric:
@@ -68,6 +79,25 @@ METRICS: dict[str, Metric] = {
         "AVG(CASE WHEN t.status = 'FAILED' THEN 1.0 ELSE 0.0 END)", "pct", True,
         "SUM(CASE WHEN t.status = 'FAILED' THEN 1 ELSE 0 END)", "COUNT(*)",
         "failed attempts / all attempts"),
+    "technical_success_rate": Metric(
+        "technical_success_rate", "Technical success rate",
+        f"SUM(CASE WHEN t.status = 'SUCCESS' THEN 1.0 ELSE 0.0 END) / "
+        f"NULLIF(SUM(CASE WHEN {_IS_BUSINESS} THEN 0 ELSE 1 END), 0)",
+        "pct", True,
+        "SUM(CASE WHEN t.status = 'SUCCESS' THEN 1 ELSE 0 END)",
+        f"SUM(CASE WHEN {_IS_BUSINESS} THEN 0 ELSE 1 END)",
+        "successful attempts / attempts excluding business declines (insufficient funds, customer "
+        "drop-off, risk and issuer policy declines)"),
+    "technical_failure_rate": Metric(
+        "technical_failure_rate", "Technical failure rate",
+        f"AVG(CASE WHEN {_IS_TECH} THEN 1.0 ELSE 0.0 END)", "pct", True,
+        f"SUM(CASE WHEN {_IS_TECH} THEN 1 ELSE 0 END)", "COUNT(*)",
+        "technical failures (timeouts, bank/network downtime) / all attempts"),
+    "business_decline_rate": Metric(
+        "business_decline_rate", "Business decline rate",
+        f"AVG(CASE WHEN {_IS_BUSINESS} THEN 1.0 ELSE 0.0 END)", "pct", True,
+        f"SUM(CASE WHEN {_IS_BUSINESS} THEN 1 ELSE 0 END)", "COUNT(*)",
+        "business declines (insufficient funds, customer drop-off, risk/issuer policy) / all attempts"),
     "attempts": Metric("attempts", "Attempts", "COUNT(*)", "int",
                        definition="count of payment attempts"),
     "successes": Metric("successes", "Successful txns",
@@ -102,6 +132,7 @@ DIMENSIONS: dict[str, Dimension] = {
     "city_tier": Dimension("city_tier", "City tier", "m.city_tier", ("merchants",)),
     "failure_reason": Dimension("failure_reason", "Failure reason",
                                 "COALESCE(t.failure_reason, '(not failed)')"),
+    "decline_type": Dimension("decline_type", "Outcome type", DECLINE_TYPE_SQL),
     "day": Dimension("day", "Day", "CAST(t.created_at AS DATE)"),
     "week": Dimension("week", "Week starting", "CAST(date_trunc('week', t.created_at) AS DATE)"),
     "hour": Dimension("hour", "Hour of day",
@@ -132,6 +163,9 @@ def catalog_text() -> str:
     for m in METRICS.values():
         lines.append(f"  {m.key}: {m.label} - {m.definition}")
     lines.append("DIMENSIONS: " + ", ".join(DIMENSIONS))
+    lines.append("FAILURE TAXONOMY: technical failures = " + ", ".join(TECHNICAL_FAILURE_REASONS)
+                 + "; business declines = " + ", ".join(BUSINESS_DECLINE_REASONS)
+                 + " (decline_type dimension; technical_success_rate excludes business declines)")
     lines.append("FILTERABLE DIMENSIONS: " + ", ".join(FILTERABLE))
     lines.append("TABLES (for free-form SQL only):")
     for k, v in TABLE_DOCS.items():

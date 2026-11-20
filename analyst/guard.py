@@ -4,7 +4,7 @@ through here before it touches the database.
 
 Checks, in order:
   1. Parses as exactly one statement, and that statement is a read-only SELECT.
-  2. No dangerous functions (file/network/system access) and no table functions.
+  2. Only allow-listed functions (pure aggregate/date/math/string); no table functions.
   3. Only logical tables from the semantic layer; no schema-qualified access.
   4. Role checks: table allowlist, PII columns, out-of-scope merchant literals.
   5. Cost heuristics: no cartesian joins, bounded fact-table scans, bounded joins.
@@ -21,10 +21,25 @@ from sqlglot import exp
 from .rbac import AccessDenied, Role
 from .semantic import FACT_TABLES, LOGICAL_TABLES, PII_COLUMNS
 
-DENY_FUNCTION_SUBSTRINGS = (
-    "read_", "glob", "copy", "attach", "install", "load", "getenv", "system",
-    "http", "parquet_", "csv", "json_", "query_table", "sniff", "pragma", "export",
-)
+# Allowlist, not denylist: a function is rejected unless it is known to be a pure computation.
+# DuckDB has hundreds of functions and extensions (file readers, HTTP, settings, system calls);
+# a denylist misses the one nobody thought of, an allowlist fails closed.
+ALLOWED_FUNCTIONS = frozenset("""
+    Count Sum Avg Min Max Stddev StddevPop StddevSamp Variance VariancePop Median Quantile
+    PercentileCont PercentileDisc ApproxQuantile ApproxDistinct CountIf ArgMax ArgMin AnyValue Mode
+    And Or Not Xor Case If Coalesce Nullif Greatest Least Cast TryCast Paren
+    Extract DateTrunc TimestampTrunc Date CurrentDate DateAdd DateSub DateDiff TimestampAdd
+    TimestampSub TimestampDiff DayOfWeek DayOfWeekIso DayOfMonth DayOfYear WeekOfYear Hour Minute
+    Month Year Day Week Quarter StrToTime TimeToStr StrToDate TsOrDsToDate TimeStrToTime TimeToUnix
+    Abs Round Floor Ceil Sqrt Pow Ln Log Exp Sign SafeDivide Div
+    Lower Upper Length Substring Concat ConcatWs Trim Pad Left Right StrPosition Initcap
+    RowNumber Rank DenseRank PercentRank CumeDist Ntile Lag Lead FirstValue LastValue
+""".split())
+# DuckDB functions sqlglot does not model as typed expressions (parsed as Anonymous)
+ALLOWED_ANONYMOUS = frozenset("""
+    date_part datepart isodow dow yearweek dayname monthname epoch_ms round_even bool_or bool_and
+    quantile_cont quantile_disc
+""".split())
 MAX_JOINS = 5
 MAX_FACT_SCANS = 2
 DEFAULT_LIMIT = 1000
@@ -76,10 +91,14 @@ class SqlGuard:
         checks.append("read-only SELECT")
 
         for fn in tree.find_all(exp.Func):
-            name = (fn.sql_name() if not isinstance(fn, exp.Anonymous) else fn.name).lower()
-            if any(s in name for s in DENY_FUNCTION_SUBSTRINGS):
-                _fail(f"Function '{name}' is not allowed (file/system access).", "dangerous_function")
-        checks.append("no file/system/network functions")
+            if isinstance(fn, exp.Anonymous):
+                ok, name = fn.name.lower() in ALLOWED_ANONYMOUS, fn.name.lower()
+            else:
+                ok, name = type(fn).__name__ in ALLOWED_FUNCTIONS, fn.sql_name().lower()
+            if not ok:
+                _fail(f"Function '{name}' is not on the allowed list (aggregates, date, math and string "
+                      "functions only).", "function_not_allowed")
+        checks.append("only allow-listed functions")
 
         cte_names = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
         tables: list[exp.Table] = []

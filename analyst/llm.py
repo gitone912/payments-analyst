@@ -18,6 +18,7 @@ import copy
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -202,6 +203,7 @@ class LLMPlanner:
         # optional client-side pacing for rate-limited tiers (e.g. Gemini free tier = 15 req/min)
         self.min_interval_s = float(os.getenv("LLM_MIN_INTERVAL_S", "0"))
         self._last_call = 0.0
+        self._pace_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -220,13 +222,15 @@ class LLMPlanner:
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise ProviderUnavailable(f"network error: {e}")
 
-    def _complete(self, user: str) -> tuple[str, int, int]:
-        if self.simulate_outage:
+    def _complete(self, user: str, simulate_outage: bool = False) -> tuple[str, int, int]:
+        if simulate_outage or self.simulate_outage:
             raise ProviderUnavailable("simulated provider outage (demo toggle)")
-        wait = self.min_interval_s - (time.monotonic() - self._last_call)
-        if wait > 0:
-            time.sleep(wait)
-        self._last_call = time.monotonic()
+        if self.min_interval_s > 0:
+            with self._pace_lock:  # reserve a slot so concurrent requests stay under the rate limit
+                slot = max(time.monotonic(), self._last_call + self.min_interval_s)
+                self._last_call = slot
+            if slot > time.monotonic():
+                time.sleep(slot - time.monotonic())
         if self.provider == "gemini":
             key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if not key:
@@ -255,11 +259,13 @@ class LLMPlanner:
         raise ProviderUnavailable("no LLM provider configured")
 
     # ------------------------------------------------------------- planning
-    def plan(self, question: str, feedback: str | None = None, context: str | None = None) -> LLMResult:
+    def plan(self, question: str, feedback: str | None = None, context: str | None = None,
+             simulate_outage: bool = False) -> LLMResult:
         res = LLMResult(plan=None)
         ck = (" ".join(question.lower().split()) + (f" || {feedback}" if feedback else "")
               + (f" || {context}" if context else ""))
-        if ck in self._cache and not self.simulate_outage:
+        outage = simulate_outage or self.simulate_outage
+        if ck in self._cache and not outage:
             res.plan = copy.deepcopy(self._cache[ck])
             res.calls.append(LLMCall(self.provider, self.model, 0, 0.0, 0, 0, 0.0, True, cached=True))
             return res
@@ -269,7 +275,7 @@ class LLMPlanner:
         for attempt in range(1, self.max_attempts + 1):
             t0 = time.perf_counter()
             try:
-                text, ti, to = self._complete(user)
+                text, ti, to = self._complete(user, outage)
             except ProviderUnavailable as e:
                 ms = (time.perf_counter() - t0) * 1000
                 res.calls.append(LLMCall(self.provider, self.model, attempt, ms, 0, 0, 0.0, False, str(e)))

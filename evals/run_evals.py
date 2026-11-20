@@ -11,6 +11,7 @@ clarification, access denials, guard blocks and planted-driver detection.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -60,6 +61,16 @@ def main(planner: str, paraphrases: bool = False):
     T_WEEKEND_LW = sr(clean, "2026-10-24", "2026-10-25")
     T_UPI_LW = sr(clean, "2026-10-19", "2026-10-25", "|AND t.method_id='UPI'")
     T_UPI_PW = sr(clean, "2026-10-12", "2026-10-18", "|AND t.method_id='UPI'")
+
+    def share(a, b, cond):
+        return truth(con, f"""SELECT AVG(({cond})::INT) FROM {clean}
+            WHERE created_at >= DATE '{a}' AND created_at < DATE '{b}' + 1""")
+    tech = "status = 'FAILED' AND failure_reason IN ('TIMEOUT', 'BANK_DOWNTIME')"
+    bus = "status = 'FAILED' AND failure_reason NOT IN ('TIMEOUT', 'BANK_DOWNTIME')"
+    T_TECH_PTS = -(share("2026-10-19", "2026-10-25", tech) - share("2026-10-12", "2026-10-18", tech)) * 100
+    T_BUS_PTS = -(share("2026-10-19", "2026-10-25", bus) - share("2026-10-12", "2026-10-18", bus)) * 100
+    T_TSR_DELTA_LW = truth(con, f"""SELECT SUM((status = 'SUCCESS')::INT) * 1.0 / SUM(CASE WHEN {bus} THEN 0 ELSE 1 END)
+        FROM {clean} WHERE bank_id = 'B04' AND created_at >= DATE '2026-10-19' AND created_at < DATE '2026-10-26'""")
 
     def result_has(a, target, tol):
         """Any numeric cell in the first row of a free-SQL result equals target (shares also as %)."""
@@ -146,6 +157,20 @@ def main(planner: str, paraphrases: bool = False):
          (a.status == "answered" and (a.plan or {}).get("intent") == "free_sql"
           and any("no standard definition" in c for c in a.caveats)),
          "vague threshold never silently ignored; definition disclosed"),
+        ("outcome_split", "Why did success rate drop last week?", "head_of_payments",
+         lambda a: any(f"technical failures {T_TECH_PTS:+.2f} pts" in f["text"]
+                       and f"business declines {T_BUS_PTS:+.2f} pts" in f["text"] for f in a.facts)
+         and any("mainly technical" in h for h in a.hypotheses),
+         f"splits the drop: technical {T_TECH_PTS:+.2f} pts vs business {T_BUS_PTS:+.2f} pts"),
+        ("technical_sr", "Technical success rate by bank last week", "head_of_payments",
+         lambda a: a.status == "answered" and abs(a.tables[next(iter(a.tables))].set_index("bank")
+                                                   .technical_success_rate["Delta Co-op Bank"] - T_TSR_DELTA_LW) < 2e-4,
+         f"technical success rate excludes business declines (Delta Co-op {T_TSR_DELTA_LW:.2%})"),
+        ("unknown_term", "Success rate for premium customers last week", "head_of_payments",
+         lambda a: (a.status == "clarify" and "premium" in a.message) if planner == "rules" else
+         (a.status == "clarify" or (a.plan or {}).get("intent") == "free_sql"
+          or "premium" in json.dumps(a.plan or {}).lower() or a.confidence.get("level") == "low"),
+         "an unrecognised word is never silently ignored"),
         ("hour_labels", "Success rate by hour of day last week", "head_of_payments",
          lambda a: a.status == "answered" and str(a.tables[next(iter(a.tables))].iloc[0, 0]) == "00:00",
          "hours shown as HH:00"),
@@ -155,6 +180,7 @@ def main(planner: str, paraphrases: bool = False):
         ("guard_multi", "SELECT 1; DROP TABLE banks", "blocked"),
         ("guard_file", "SELECT * FROM read_csv_auto('/etc/passwd')", "blocked"),
         ("guard_schema", "SELECT COUNT(*) FROM raw.transactions", "blocked"),
+        ("guard_unlisted_fn", "SELECT current_setting('threads')", "blocked"),
         ("guard_cartesian", "SELECT COUNT(*) FROM transactions a, transactions b", "blocked"),
         ("guard_star_pii", "SELECT * FROM transactions", "denied"),
         ("guard_ok", "SELECT COUNT(*) AS n FROM transactions", "answered"),
