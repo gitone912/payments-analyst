@@ -164,6 +164,8 @@ and "high-value". With the LLM, the model writes SQL that matches the hand-writt
 exactly. Without it, the engine asks instead of answering a different question. Two follow-up
 cases ("now break that down by bank", "what about UPI?") check that context carries over. The
 eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
+Provider errors are retried twice with a backoff (`EVAL_PROVIDER_RETRIES`, `EVAL_PROVIDER_BACKOFF_S`).
+Exit codes: `0` all passed, `1` at least one wrong answer, `3` only provider errors remain.
 
 The paraphrases were written after the prompt was finalised and are not used as prompt examples.
 They show whether the planner generalises beyond the questions it was tuned against.

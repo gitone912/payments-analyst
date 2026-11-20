@@ -6,6 +6,8 @@ engine's compiler), then compared with what the engine answers. Also checks beha
 clarification, access denials, guard blocks and planted-driver detection.
 
     python evals/run_evals.py            # deterministic planner
+    Exit codes: 0 all passed, 1 at least one wrong answer, 3 only model-provider errors remain
+    (after EVAL_PROVIDER_RETRIES retries with EVAL_PROVIDER_BACKOFF_S backoff).
     LLM_PROVIDER=gemini GEMINI_API_KEY=... python evals/run_evals.py --planner llm
 """
 from __future__ import annotations
@@ -15,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -23,6 +26,26 @@ import duckdb  # noqa: E402
 from analyst.engine import AnalystEngine  # noqa: E402
 
 DB = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
+
+
+PROVIDER_RETRIES = int(os.getenv("EVAL_PROVIDER_RETRIES", "2"))
+PROVIDER_BACKOFF_S = float(os.getenv("EVAL_PROVIDER_BACKOFF_S", "20"))
+
+
+def is_provider_error(a) -> bool:
+    return a.status == "error" and "provider unavailable" in a.message
+
+
+def ask_retrying(eng, *args, **kwargs):
+    """Model providers return transient 429/503s. The eval measures answers, not provider uptime, so a
+    provider error is retried after a backoff; only one that persists is reported (as PROVIDER)."""
+    a = eng.ask(*args, **kwargs)
+    for attempt in range(PROVIDER_RETRIES):
+        if not is_provider_error(a):
+            break
+        time.sleep(PROVIDER_BACKOFF_S * (attempt + 1))
+        a = eng.ask(*args, **kwargs)
+    return a
 
 
 def truth(con, sql):
@@ -191,15 +214,16 @@ def main(planner: str, paraphrases: bool = False):
     total = len(cases) + len(sql_cases) + 1
     cache = {}
     for cid, q, role, check, desc in cases:
-        a = cache.get((q, role)) or eng.ask(q, role, planner)
-        cache[(q, role)] = a
+        a = cache.get((q, role)) or ask_retrying(eng, q, role, planner)
+        if not is_provider_error(a):
+            cache[(q, role)] = a
         try:
             ok = bool(check(a))
         except Exception as e:  # noqa: BLE001
             ok = False
             desc += f" [check error: {e}]"
         passed += ok
-        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_err = is_provider_error(a)
         provider_errs += (not ok) and provider_err
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}" + ("  [model provider error, not a wrong answer]" if tag == "PROVIDER" else ""))
@@ -214,15 +238,15 @@ def main(planner: str, paraphrases: bool = False):
     ]
     total += len(followups)
     for cid, q1, q2, check, desc in followups:
-        first = cache.get((q1, "head_of_payments")) or eng.ask(q1, "head_of_payments", planner)
-        a = eng.ask(q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
+        first = cache.get((q1, "head_of_payments")) or ask_retrying(eng, q1, "head_of_payments", planner)
+        a = ask_retrying(eng, q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
         try:
             ok = bool(check(a))
         except Exception as e:  # noqa: BLE001
             ok = False
             desc += f" [check error: {e}]"
         passed += ok
-        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_err = is_provider_error(a)
         provider_errs += (not ok) and provider_err
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}")
@@ -245,7 +269,12 @@ def main(planner: str, paraphrases: bool = False):
                                          if provider_errs else ""))
     if paraphrases:
         run_paraphrases(eng, planner)
-    return 0 if passed == total else 1
+    if passed == total:
+        return 0
+    if passed + provider_errs == total:
+        print("Only model-provider errors remain (no wrong answers). Exit code 3: retry later or use a paid key.")
+        return 3
+    return 1
 
 
 # Held-out rewordings: never used to write the planner prompt. They check the plan shape
@@ -274,7 +303,7 @@ def run_paraphrases(eng, planner):
     print("\nHeld-out paraphrases (plan shape):")
     ok_n = 0
     for q, status, exp in PARAPHRASES:
-        a = eng.ask(q, "head_of_payments", planner)
+        a = ask_retrying(eng, q, "head_of_payments", planner)
         p = a.plan or {}
         why = []
         if a.status != status:
