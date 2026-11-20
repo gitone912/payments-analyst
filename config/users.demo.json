@@ -1,0 +1,29 @@
+{
+  "_comment": "DEMO ACCOUNTS ONLY. Passwords are published in the README. For any real deployment replace this file (USERS_FILE) or use AUTH_MODE=header behind SSO.",
+  "users": [
+    {
+      "username": "head.payments",
+      "role": "head_of_payments",
+      "display_name": "Head of Payments (demo)",
+      "salt": "b55f4323509ded72cd36a54d21b19541",
+      "iterations": 200000,
+      "hash": "938573df35fc9d226b8e95d433df15468958c62f0b83a15be832efaa272de118"
+    },
+    {
+      "username": "risk.ops",
+      "role": "risk_ops",
+      "display_name": "Risk Ops analyst (demo)",
+      "salt": "5cb8a2be04fe4eddb9be8e8e47215347",
+      "iterations": 200000,
+      "hash": "19d3c386e3e00266135bfd21fb09e9a654992500d1a3298fb3b95900178220f2"
+    },
+    {
+      "username": "kam.a",
+      "role": "kam_portfolio_a",
+      "display_name": "KAM Portfolio A (demo)",
+      "salt": "3f21c693818e75315e8c5e2459b2a25b",
+      "iterations": 200000,
+      "hash": "57625d93bbe9b5212142d92bdbdd9732d81c5ae8e52d1869e37dd871212b7baf"
+    }
+  ]
+}

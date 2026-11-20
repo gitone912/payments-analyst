@@ -25,6 +25,7 @@ SOURCE_WORDS = ("settlement", "finance", "reconcil", "two sources", "disagree", 
 
 DIM_PATTERNS = [
     ("customer_vpa", r"\b(vpa|vpas|customer|customers|payer|payers)\b"),
+    ("decline_type", r"\b(decline type|outcome type|technical vs\.? business|business vs\.? technical)\b"),
     ("failure_reason", r"\b(failure reason|reason|reasons|error code|decline code)s?\b"),
     ("bank_tier", r"\bbank tier\b"),
     ("bank", r"\b(bank|banks|issuer|issuers)\b"),
@@ -84,9 +85,18 @@ _DOWN = r"\b(drop\w*|declin\w*|fall\w*|fell|dip\w*|down|decreas\w*|worse\w*|lowe
 _UP = r"\b(rise|rose|risen|rising|increas\w*|up|improv\w*|grow\w*|grew|higher|jump\w*|spike\w*|went up)\b"
 
 
+_METRIC_NAME_PHRASES = (r"\b(?:business|customer)[- ]declines?(?: rate)?\b|\bdeclines? (?:type|rate|code)s?\b"
+                        r"|\btechnical (?:failures?|declines?)(?: rate)?\b|\btechnical success(?: rate)?\b")
+
+
+def strip_metric_names(q: str) -> str:
+    """'business decline rate' names a metric; it does not say the metric declined."""
+    return re.sub(_METRIC_NAME_PHRASES, " metric ", q.lower())
+
+
 def premise_direction(question: str) -> str | None:
     """'down' / 'up' if the question presupposes a direction of change, else None."""
-    q = question.lower()
+    q = strip_metric_names(question)
     down, up = bool(re.search(_DOWN, q)), bool(re.search(_UP, q))
     if down and not up:
         return "down"
@@ -102,6 +112,69 @@ _FOLLOWUP = (r"^\s*(?:and|now|then|also|ok(?:ay)?|what about|how about|same|inst
 def is_followup(question: str) -> bool:
     """Does the question lean on the previous one ("now break that down by bank", "what about UPI")?"""
     return bool(re.search(_FOLLOWUP, question.lower()))
+
+
+# Every word the deterministic planner knows how to act on (or can safely ignore). Anything else in
+# a question is "unrecognised": the rule planner asks instead of answering a different question,
+# and an LLM plan must say what it did with the word. Allowlist, so new phrasings fail closed.
+_KNOWN_WORDS = set("""
+a an the of in on at for to from by with and or vs versus between per each every all any our we us
+is are was were be been being do does did doing done has have had it its this that these those them
+what which who why how when where whats show give me tell list get find see compare comparison split
+can could would should please about across over under than then also now ok okay just only same
+instead again and so up down out into within during since until before after past previous prior
+last this next current latest recent so-far far to-date till today yesterday week weeks weekly
+day days daily month months monthly year years quarter quarters ytd mtd wow mom date dates period
+periods time trend trends over-time series history historical moving
+success successful succeeded rate rates ratio sr percent percentage share failure failures failed fail
+failing decline declines declined declining drop drops dropped dropping fell fall falling fallen dip
+dips dipped down worse worsen worsened lower low lowest high higher highest top bottom best worst
+most least rise rose risen rising increase increased increasing improve improved improving grow
+grew growth jump jumped spike spiked change changes changed changing move moved movement shift
+shifted swing deteriorate deteriorated deterioration went go going gone happen happened happening
+cause caused causes causing driver drivers drive drove driving drives contribute contributed
+contributing contribution contributions contributor contributors explain explained explanation behind
+reason reasons root impact impacted effect affected affecting
+pending excluding exclude excluded excl including include included incl without with terminal
+attempt attempts attempted transaction transactions txn txns payment payments volume volumes count
+counts number numbers many much total totals overall gmv tpv revenue value processed amount amounts
+average avg ticket size aov mean
+bank banks issuer issuers tier tiers method methods mode modes instrument instruments merchant merchants
+category categories vertical verticals segment segments city cities hour hours hourly breakdown
+customer customers payer payers vpa vpas error code codes
+upi card cards credit debit netbanking net banking nb wallet wallets
+settlement settlements finance financial reconcile reconciliation reconciled agree agrees disagree
+disagreement match matches mismatch consistent consistency differ differs difference source sources
+two data team teams records record logs log numbers system systems report reported
+raw duplicate duplicates duplicated ingested dedup deduplicated
+action actions recommend recommended recommendation recommendations next step steps take should
+done fix
+performance performing perform doing approval conversion
+technical business tsr outcome outcomes type types
+compared comparing against relative break broke broken traffic you your not only own there their
+more less very really both other others look looking need want know let like check still even
+""".split())
+_JANUARY_TO_DECEMBER = ("january february march april may june july august september october november "
+                        "december jan feb mar apr jun jul aug sep sept oct nov dec").split()
+_KNOWN_WORDS.update(_JANUARY_TO_DECEMBER)
+
+
+def unrecognised_terms(question: str, extra_known: set[str] = frozenset()) -> list[str]:
+    """Content words in the question that no planner rule accounts for (names of banks, merchants and
+    categories are passed in as extra_known). Words inside detected conditions are left to that check."""
+    q = question.lower()
+    for pat, _ in _CONDITION_PATTERNS:
+        q = re.sub(pat, " ", q)
+    out = []
+    for w in re.findall(r"[a-z][a-z'-]*", q):
+        w = w.strip("'-").removesuffix("'s")
+        if len(w) < 3 or w in _KNOWN_WORDS or w in extra_known or re.fullmatch(r"\d+", w):
+            continue
+        if w.endswith("s") and (w[:-1] in _KNOWN_WORDS or w[:-1] in extra_known):
+            continue
+        if w not in out:
+            out.append(w)
+    return out
 
 
 METRIC_CLARIFICATION = {
@@ -222,7 +295,13 @@ class RulePlanner:
 
         # metric
         metric = None
-        if re.search(r"excl\w*\.? pending|without pending|terminal", q):
+        if re.search(r"technical success|\btsr\b", q):
+            metric = "technical_success_rate"
+        elif re.search(r"technical (?:failure|failures|failure rate|decline)", q):
+            metric = "technical_failure_rate"
+        elif re.search(r"(?:business|customer)[- ]declines?|business decline rate", q):
+            metric = "business_decline_rate"
+        elif re.search(r"excl\w*\.? pending|without pending|terminal", q):
             metric = "success_rate_excl_pending"
         elif re.search(r"success rate|\bsr\b|success ratio|success %", q):
             metric = "success_rate"
@@ -241,7 +320,7 @@ class RulePlanner:
         if any(w in q for w in SOURCE_WORDS):
             intent = "compare_sources"
             metric = metric or "success_rate"
-        elif re.search(r"\b(" + "|".join(DIAG_WORDS) + r")\w*\b", q):
+        elif re.search(r"\b(" + "|".join(DIAG_WORDS) + r")\w*\b", strip_metric_names(q)):
             intent = "diagnose_change"
         elif any(w in q for w in TREND_WORDS):
             intent = "trend"
@@ -318,6 +397,10 @@ class RulePlanner:
                 assumptions.append("Kept filters from the previous question: "
                                    + ", ".join(f"{k}={'/'.join(v)}" for k, v in merged.items()) + ".")
             filters = {**merged, **filters}
+        if "decline_type" in dims and metric in ("success_rate", "failure_rate", "success_rate_excl_pending"):
+            metric = "attempts"  # a status-based rate is 0/100% inside each outcome type: show volumes
+            assumptions.append("Split by outcome type shows attempts per type (technical failure, business "
+                               "decline, pending, success).")
         use_raw = bool(re.search(r"\braw\b|including duplicates|with duplicates", q)) or bool(prev and prev.use_raw)
 
         # time window handling

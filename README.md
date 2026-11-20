@@ -18,9 +18,9 @@ each kept separate.
 ```bash
 pip install -r requirements.txt
 python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
-streamlit run app.py                    # UI at http://localhost:8501
-python evals/run_evals.py               # 36 known-answer / safety checks
-python -m pytest -q tests               # 14 unit tests
+streamlit run app.py                    # UI at http://localhost:8501 (sign in: see below)
+python evals/run_evals.py               # 40 known-answer / safety checks
+python -m pytest -q tests               # 23 unit tests
 python cli.py "why did success rate drop last week?" --sql
 python cli.py "why did success rate drop last week?" --then "now break that down by bank"
 ```
@@ -38,6 +38,25 @@ python evals/run_evals.py --planner llm --paraphrases    # evals against the liv
 The Gemini key is sent in the `x-goog-api-key` header, never in the URL, so it can't leak into logs or tracebacks.
 Older defaults (`gemini-2.0-flash`, `gemini-2.5-flash`) now return 404 for new keys.
 
+### Sign-in
+
+The role comes from the signed-in account, never from a control the user can change.
+
+| Demo account | Password | Role |
+|---|---|---|
+| `head.payments` | `demo-head` | Head of Payments (all merchants, no PII) |
+| `risk.ops` | `demo-risk` | Risk Ops (PII visible) |
+| `kam.a` | `demo-kam` | KAM Portfolio A (own merchants only) |
+
+These are **demo accounts** in `config/users.demo.json` (salted PBKDF2-SHA256 hashes). For anything
+real, point `USERS_FILE` at your own file (`python -m analyst.auth add <user> <role>` prompts for a
+password), or run behind an SSO proxy with `AUTH_MODE=header`: the proxy authenticates the user and
+sets `X-Forwarded-Email` (configurable via `AUTH_HEADER`); the role is still looked up from the users
+file. Header mode is only safe when the app is reachable exclusively through that proxy.
+
+Every query is appended to `logs/audit.jsonl` (user, role, time, SQL, outcome; path via `AUDIT_LOG`).
+Users see only their own entries in the Session log tab.
+
 Deep link for demos: `http://localhost:8501/?q=Why did success rate drop last week?`
 
 ## Architecture
@@ -53,11 +72,11 @@ Plan validation (known metrics/dimensions/filters, time window inside data, ambi
   ▼
 Compiler (plan → SQL over *logical* tables using the semantic layer)
   ▼
-SQL Guard (sqlglot AST): read-only · single statement · no file/system functions ·
+SQL Guard (sqlglot AST): read-only · single statement · allow-listed functions only ·
            catalog tables only · RBAC (tables, PII columns, merchant scope) ·
            no cartesian joins / bounded fact scans · row-level scope rewrite · auto LIMIT
   ▼
-Executor (read-only DuckDB, 8s timeout via interrupt, result cache, audit log)
+Executor (read-only DuckDB, one cursor per query, 8s timeout, result cache, persistent audit log)
   ▼
 Analysis: headline + CI → mix/rate decomposition across 7 segmentations →
           significance-filtered rate drivers → failure-reason drill-down
@@ -87,6 +106,24 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
   The primary view is the segmentation where mix explains the most. Rate drivers are only
   taken from that view, because at a coarser level a mix shift *inside* a segment looks
   like that segment's rate dropping (e.g. "UPI got worse"). The eval suite checks this.
+- **Technical vs business first.** Failures are classified once in the semantic layer: technical
+  (TIMEOUT, BANK_DOWNTIME) vs business declines (insufficient funds, customer drop-off, risk and
+  issuer policy). Every success-rate diagnosis splits the change exactly into technical, business
+  and pending parts, and reports the technical success rate (business declines left out of the
+  denominator). The hypothesis and first recommendation follow from which side moved.
+  `technical_success_rate`, `technical_failure_rate`, `business_decline_rate` and the
+  `decline_type` dimension are also available directly.
+- **Fail closed.** The SQL guard allows only listed functions (aggregate, date, math, string), so
+  a dangerous DuckDB function nobody thought of is rejected; the old blocked-name list let e.g.
+  `current_setting()` through. Without the LLM, a word the planner has no rule for ("premium
+  customers") gets a clarifying question, not an answer to a different question. With the LLM,
+  each such word must appear in the plan or its assumptions, or the answer is marked low
+  confidence with a caveat. Model-written SQL must visibly apply every detected condition
+  (threshold value, day of week, time of day), and the answer lists the exact filters applied.
+- **Safe for concurrent users.** One engine serves every session. All per-request state (follow-up
+  context, outage simulation) travels with the request, each query runs on its own DuckDB cursor
+  (a timeout cancels only that query), and query IDs are numbered per answer. A threaded test
+  checks that follow-up context never crosses between users.
 - **Clarify rather than guess** when the comparison period or the denominator is missing.
   Lower-risk defaults (e.g. "last 7 days" for a snapshot) are applied and listed as assumptions.
   The metric-ambiguity check is enforced in code on LLM plans too. If the model quietly picks a
@@ -117,16 +154,18 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
 
 Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
 
-| Planner | Core suite (36 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
+| Planner | Core suite (40 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
 |---|---|---|
-| Deterministic rules | 36/36 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
-| Gemini `gemini-3.5-flash-lite` (live) | 34/36 on the last full run, with the 2 misses being provider 503s; both pass when re-run | 10/10 |
+| Deterministic rules | 40/40 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
+| Gemini `gemini-3.5-flash-lite` (live) | 32/40 on the latest run; all 8 misses were provider 503s, 0 wrong answers. The previous full run (36 checks) was 34/36, again with only provider errors | 9/10 (the miss was a 503) |
 
 The core suite includes questions the catalog can't express: amount thresholds, "on weekends",
 and "high-value". With the LLM, the model writes SQL that matches the hand-written ground truth
 exactly. Without it, the engine asks instead of answering a different question. Two follow-up
 cases ("now break that down by bank", "what about UPI?") check that context carries over. The
 eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
+Provider errors are retried twice with a backoff (`EVAL_PROVIDER_RETRIES`, `EVAL_PROVIDER_BACKOFF_S`).
+Exit codes: `0` all passed, `1` at least one wrong answer, `3` only provider errors remain.
 
 The paraphrases were written after the prompt was finalised and are not used as prompt examples.
 They show whether the planner generalises beyond the questions it was tuned against.
@@ -153,5 +192,10 @@ to the rule planner, and the fallback is shown in the trace.
 - Driver attribution is descriptive, not causal. Causes are always shown as hypotheses.
 - The rule planner covers common question shapes (diagnose, breakdown, trend, source comparison).
   Anything else needs the LLM, or gets a clarification.
-- Roles are selected in the UI (no real auth). Cost controls are heuristic (AST rules + timeout), not optimizer-based.
+- Authentication is a local users file (demo accounts above) or a trusted SSO header; there is no
+  built-in OIDC flow. Cost controls are heuristic (AST rules + timeout), not optimizer-based.
+- The failure taxonomy (technical vs business) is a fixed mapping of this dataset's failure reasons;
+  real issuer/NPCI response codes would need a maintained mapping owned by the payments team.
+- The vocabulary check is deliberately strict: an unusual but harmless word makes the rule planner
+  ask. Extend `_KNOWN_WORDS` in `rule_planner.py` as new phrasings come up.
 - LLM cost uses list prices in `llm.py`; adjust to your contract.

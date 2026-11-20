@@ -4,3 +4,4 @@ __pycache__/
 data/payments.duckdb
 data/payments.duckdb.wal
 .env
+logs/

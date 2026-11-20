@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import pandas as pd
+import sqlglot
+from sqlglot import exp
 
 from . import compiler
 from .dq import DQFinding, run_checks
@@ -25,7 +27,7 @@ from .llm import LLMCall, LLMPlanner, plan_from_json
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
 from .rule_planner import (RulePlanner, is_followup, metric_ambiguity, premise_direction,
-                           unmodelled_conditions)
+                           unmodelled_conditions, unrecognised_terms)
 from .semantic import DIMENSIONS, METRICS
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
@@ -78,12 +80,18 @@ class Answer:
     denial_rule: str | None = None
     total_ms: float = 0.0
     headline: str = ""
+    user: str = ""
+    # per-request planning context. Lives on the Answer, never on the shared engine: one engine
+    # instance serves every user, so request state stored on it would leak between users.
+    prev_plan: Plan | None = field(default=None, repr=False, compare=False)
+    llm_context: str | None = field(default=None, repr=False, compare=False)
+    simulate_outage: bool = field(default=False, repr=False, compare=False)
+    unaddressed_terms: list[str] = field(default_factory=list, repr=False, compare=False)
 
 
 class AnalystEngine:
-    def __init__(self, db_path: str, llm_provider: str | None = None):
-        self._followup: tuple[Plan | None, str | None] = (None, None)
-        self.ex = Executor(db_path)
+    def __init__(self, db_path: str, llm_provider: str | None = None, audit_path: str | None = None):
+        self.ex = Executor(db_path, audit_path=audit_path)
         m = self.ex.raw("SELECT merchant_id, merchant_name, category, kam_portfolio FROM raw.merchants")
         self.merchants = m
         lookup = {}
@@ -98,6 +106,10 @@ class AnalystEngine:
         banks = self.ex.raw("SELECT bank_name FROM raw.banks ORDER BY 1").bank_name.tolist()
         cats = sorted(m.category.unique().tolist())
         self.rules = RulePlanner(self.data_start, self.data_end, m.merchant_name.tolist(), banks, cats)
+        self.known_names: set[str] = set()
+        tiers = self.ex.raw("SELECT DISTINCT city_tier FROM raw.merchants").city_tier.tolist()
+        for n in [*m.merchant_name, *cats, *banks, *tiers]:
+            self.known_names.update(re.findall(r"[a-z][a-z0-9]*", str(n).lower().replace("_", " ")))
         self.llm = LLMPlanner(self.data_start, self.data_end, banks, cats, provider=llm_provider)
         self.dq: list[DQFinding] = run_checks(self.ex)
 
@@ -111,29 +123,27 @@ class AnalystEngine:
     def _run(self, ans: Answer, role: Role, sql: str, purpose: str) -> tuple[pd.DataFrame, QueryRecord]:
         g = self.guard.check(sql, role, self.visible_merchants(role))
         df, rec = self.ex.run(g.executable_sql, original_sql=g.original_sql, purpose=purpose,
-                              role=role.key, checks=g.checks)
+                              role=role.key, checks=g.checks, query_id=f"Q{len(ans.queries) + 1}",
+                              user=ans.user)
         ans.queries.append(rec)
         return df, rec
 
     # ------------------------------------------------------------ planning
     def make_plan(self, question: str, ans: Answer, mode: str, previous: dict | None = None) -> Plan:
-        prev_plan, ctx = None, None
         if previous and previous.get("plan") and is_followup(question):
-            prev_plan = plan_from_json(json.dumps(previous["plan"]))
-            ctx = (f"Previous question: {previous.get('question', '')}\n"
-                   f"Previous plan: {json.dumps(previous['plan'], default=str)}")
+            ans.prev_plan = plan_from_json(json.dumps(previous["plan"]))
+            ans.llm_context = (f"Previous question: {previous.get('question', '')}\n"
+                               f"Previous plan: {json.dumps(previous['plan'], default=str)}")
             ans.steps.append(Step("follow_up", "ok", f"treated as a follow-up to: {previous.get('question', '')}"))
-        self._followup = (prev_plan, ctx)
         plan = self._make_plan(question, ans, mode)
         plan = self._coverage_guard(question, plan, ans, mode)
         if ans.planner_used.startswith("LLM") and plan.intent != "clarify":
             plan = self._period_guard(question, plan, ans, mode)
         return plan
 
-    def _period_problems(self, question: str, plan: Plan) -> list[str]:
+    def _period_problems(self, question: str, plan: Plan, prev_plan: Plan | None = None) -> list[str]:
         """Does the plan stay inside the period the question names? Checked deterministically, because a
         model that answers 'weekends last week' with 18-19 Oct (Sun + Mon) is wrong but looks right."""
-        prev_plan = self._followup[0]
         rw, _, _ = self.rules.parse_time(" " + question.lower().strip() + " ")
         if rw is None and prev_plan is not None:
             rw = prev_plan.window
@@ -150,24 +160,58 @@ class AnalystEngine:
             return [f"the plan uses {plan.window.start}..{plan.window.end}, outside {lo}..{hi}"]
         return []
 
+    @staticmethod
+    def _condition_problems(question: str, plan: Plan) -> list[str]:
+        """Model-written SQL must visibly apply each condition the question states."""
+        if plan.intent != "free_sql" or not plan.sql:
+            return []
+        sql = plan.sql.lower()
+        sql_digits = set(re.findall(r"\d+(?:\.\d+)?", sql.replace(",", "")))
+        probs = []
+        for g in unmodelled_conditions(question):
+            kind, txt = g.split(": ", 1)
+            txt = txt.strip("'")
+            if kind in ("numeric threshold", "numeric range"):
+                for num, unit in re.findall(r"(\d[\d,]*(?:\.\d+)?)\s*(k|lakh)?", txt):
+                    v = float(num.replace(",", "")) * {"k": 1_000, "lakh": 100_000}.get(unit, 1)
+                    want = {f"{v:g}", str(int(v)) if v == int(v) else f"{v:g}"}
+                    if not want & sql_digits:
+                        probs.append(f"the SQL does not use the threshold {txt}")
+            elif kind == "day of week" and not re.search(r"dayofweek|\bdow\b|isodow|dayname|weekday|strftime", sql):
+                probs.append(f"the SQL does not filter on day of week ('{txt}')")
+            elif kind == "time of day" and not re.search(r"\bhour\b|strftime|extract|date_part", sql):
+                probs.append(f"the SQL does not filter on time of day ('{txt}')")
+            elif kind == "vague threshold" and "amount_inr" not in sql:
+                probs.append(f"the SQL does not define '{txt}' on amount_inr")
+        return probs
+
+    def _unaddressed(self, question: str, plan: Plan) -> list[str]:
+        """Words outside the planner vocabulary that the LLM plan neither applies nor explains."""
+        text = json.dumps(plan.to_dict(), default=str).lower()
+        return [w for w in unrecognised_terms(question, self.known_names) if w not in text]
+
     def _period_guard(self, question: str, plan: Plan, ans: Answer, mode: str) -> Plan:
-        probs = self._period_problems(question, plan)
+        probs = (self._period_problems(question, plan, ans.prev_plan)
+                 + self._condition_problems(question, plan))
         if not probs:
-            return plan
+            return self._terms_check(question, plan, ans)
         ans.steps.append(Step("period_check", "fail", "; ".join(probs)))
         res = self.llm.plan(question, feedback=(
-            "Your plan failed the period check: " + "; ".join(probs)
-            + ". Every date you use must lie inside the period the question asks about. Return a corrected plan."),
-            context=self._followup[1])
+            "Your plan failed validation: " + "; ".join(probs)
+            + ". Every date must lie inside the period the question asks about, and the SQL must apply every "
+              "condition in the question. Return a corrected plan."),
+            context=ans.llm_context, simulate_outage=ans.simulate_outage)
         ans.llm_calls.extend(res.calls)
-        if res.plan is not None and not self._period_problems(question, res.plan):
-            ans.steps.append(Step("period_check", "fixed", "model corrected its period after feedback"))
-            return self._coverage_guard(question, res.plan, ans, mode)
-        ans.steps.append(Step("period_check", "fallback", "model could not keep to the period; using the "
+        if res.plan is not None and not (self._period_problems(question, res.plan, ans.prev_plan)
+                                         + self._condition_problems(question, res.plan)):
+            ans.steps.append(Step("period_check", "fixed", "model corrected its plan after feedback"))
+            return self._terms_check(question, self._coverage_guard(question, res.plan, ans, mode), ans)
+        ans.steps.append(Step("period_check", "fallback", "model could not produce a valid plan; using the "
                                                           "deterministic planner"))
-        ans.caveats.append("The language model's plan used the wrong dates, so the deterministic planner was used.")
+        ans.caveats.append("The language model's plan failed validation (dates or conditions), so the "
+                           "deterministic planner was used.")
         ans.planner_used = "Deterministic rule planner (LLM plan rejected by period check)"
-        return self._coverage_guard(question, self.rules.plan(question, self._followup[0]), ans, "rules")
+        return self._coverage_guard(question, self.rules.plan(question, ans.prev_plan), ans, "rules")
 
     def _coverage_guard(self, question: str, plan: Plan, ans: Answer, mode: str) -> Plan:
         """A catalog plan that silently drops a condition ("above 5000 INR") answers a different
@@ -175,17 +219,21 @@ class AnalystEngine:
         if plan.intent == "free_sql":
             return plan
         gaps = list(dict.fromkeys(unmodelled_conditions(question) + list(plan.unsupported)))
+        if not ans.planner_used.startswith("LLM"):
+            # the rule planner only understands words it has rules for: anything else means it may be
+            # answering a different question, so it must not answer (fail closed)
+            gaps += [f"unrecognised term: '{w}'" for w in unrecognised_terms(question, self.known_names)]
         if not gaps:
             return plan
         if plan.intent == "clarify" and ans.planner_used.startswith("LLM"):
             return plan  # the model already chose to ask
         ans.steps.append(Step("coverage_guard", "warn",
                               f"plan '{plan.intent}' cannot apply: {'; '.join(gaps)}"))
-        if mode in ("auto", "llm") and self.llm.enabled and not self.llm.simulate_outage:
+        if mode in ("auto", "llm") and self.llm.enabled and not (ans.simulate_outage or self.llm.simulate_outage):
             res = self.llm.plan(question, feedback=(
                 "Your catalog plan cannot apply these conditions from the question: " + "; ".join(gaps)
                 + ". Return intent free_sql with ONE SELECT that applies every condition, or clarify."),
-                context=self._followup[1])
+                context=ans.llm_context, simulate_outage=ans.simulate_outage)
             ans.llm_calls.extend(res.calls)
             if res.plan is not None and res.plan.intent in ("free_sql", "clarify"):
                 ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model}) - free SQL"
@@ -194,22 +242,48 @@ class AnalystEngine:
                 return res.plan
         ans.steps.append(Step("coverage_guard", "clarify", "no plan applies every condition; asking"))
         cond = "; ".join(g.split(": ", 1)[-1] for g in gaps)
+        unknown = all(g.startswith("unrecognised term") for g in gaps)
         return Plan(intent="clarify", metric=plan.metric, clarification={
-            "question": (f"I can't apply {cond} with the standard metrics, and I won't answer while ignoring it. "
+            "question": (f"I don't know how to apply {cond} to this data, and I won't answer while ignoring it. "
+                         "Rephrase using metrics, banks, methods, merchants, categories or dates, or enable "
+                         "the LLM planner." if unknown else
+                         f"I can't apply {cond} with the standard metrics, and I won't answer while ignoring it. "
                          "Enable the LLM planner (it can write a guarded custom query), use the SQL playground, "
                          "or drop the condition."),
             "options": []})
 
+    def _terms_check(self, question: str, plan: Plan, ans: Answer) -> Plan:
+        if plan.intent == "clarify":
+            return plan
+        missing = self._unaddressed(question, plan)
+        if not missing:
+            return plan
+        ans.steps.append(Step("terms_check", "warn", f"plan does not mention: {', '.join(missing)}"))
+        res = self.llm.plan(question, feedback=(
+            "Your plan does not show how it applies these words from the question: " + ", ".join(missing)
+            + ". Apply them (free_sql if needed), or list them in 'unsupported' / explain in 'assumptions' "
+              "why they do not change the query."), context=ans.llm_context, simulate_outage=ans.simulate_outage)
+        ans.llm_calls.extend(res.calls)
+        if (res.plan is not None and not self._unaddressed(question, res.plan)
+                and not self._period_problems(question, res.plan, ans.prev_plan)
+                and not self._condition_problems(question, res.plan)):
+            ans.steps.append(Step("terms_check", "fixed", "model accounted for every term"))
+            if res.plan.unsupported and res.plan.intent not in ("free_sql", "clarify"):
+                return self._coverage_guard(question, res.plan, ans, "llm")
+            return res.plan
+        ans.unaddressed_terms = missing
+        return plan
+
     def _make_plan(self, question: str, ans: Answer, mode: str) -> Plan:
         t0 = time.perf_counter()
         if mode in ("auto", "llm") and self.llm.enabled:
-            res = self.llm.plan(question, context=self._followup[1])
+            res = self.llm.plan(question, context=ans.llm_context, simulate_outage=ans.simulate_outage)
             ans.llm_calls.extend(res.calls)
             if res.plan is not None:
                 ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model})"
                 ans.steps.append(Step("plan", "ok", f"{ans.planner_used}, {len(res.calls)} call(s)",
                                       (time.perf_counter() - t0) * 1000))
-                amb = metric_ambiguity(question) if self._followup[0] is None else None
+                amb = metric_ambiguity(question) if ans.prev_plan is None else None
                 if amb is not None and res.plan.intent != "clarify":
                     ans.steps.append(Step("ambiguity_guard", "override",
                                           f"LLM chose metric '{res.plan.metric}' but the question names no "
@@ -223,7 +297,7 @@ class AnalystEngine:
                                   "fell back to deterministic planner"))
             ans.caveats.append("The language model was unavailable or returned an invalid plan, so the "
                                "deterministic planner was used. Supported question types still work.")
-        plan = self.rules.plan(question, self._followup[0])
+        plan = self.rules.plan(question, ans.prev_plan)
         ans.planner_used = ans.planner_used or "Deterministic rule planner"
         ans.steps.append(Step("plan", "ok", "Deterministic rule planner", (time.perf_counter() - t0) * 1000))
         return plan
@@ -240,11 +314,13 @@ class AnalystEngine:
 
     # ------------------------------------------------------------ entry
     def ask(self, question: str, role_key: str = "head_of_payments", planner_mode: str = "auto",
-            previous: dict | None = None) -> Answer:
-        """previous: {"question": ..., "plan": ...} of the last answered question, for follow-ups."""
+            previous: dict | None = None, *, user: str = "", simulate_outage: bool = False) -> Answer:
+        """previous: {"question": ..., "plan": ...} of the last answered question, for follow-ups.
+        user: authenticated identity, written to the audit log. All per-request state lives on the
+        returned Answer, so one engine can serve concurrent users safely."""
         t0 = time.perf_counter()
         role = ROLES[role_key]
-        ans = Answer(question=question, role=role.label)
+        ans = Answer(question=question, role=role.label, user=user, simulate_outage=simulate_outage)
         try:
             plan = self.make_plan(question, ans, planner_mode, previous)
             ans.plan = plan.to_dict()
@@ -283,6 +359,12 @@ class AnalystEngine:
                        "trend": self._trend, "compare_sources": self._sources,
                        "free_sql": self._free_sql}[plan.intent]
             handler(plan, role, ans)
+            if ans.unaddressed_terms:
+                terms = ", ".join(f"'{t}'" for t in ans.unaddressed_terms)
+                ans.caveats.insert(0, f"The question mentions {terms}, which this answer may not apply. "
+                                      "Check the plan in the Trace tab before relying on it.")
+                ans.confidence = {"level": "low", "reasons": [f"Terms not accounted for in the plan: {terms}."]
+                                  + ans.confidence.get("reasons", [])}
             ans.citation = self._citation(plan)
         except AccessDenied as e:
             ans.caveats, ans.facts = [], []
@@ -308,10 +390,10 @@ class AnalystEngine:
             ans.total_ms = (time.perf_counter() - t0) * 1000
         return ans
 
-    def run_sql(self, sql: str, role_key: str) -> Answer:
+    def run_sql(self, sql: str, role_key: str, *, user: str = "") -> Answer:
         """SQL playground: hand-written SQL gets exactly the same guard as model SQL."""
         role = ROLES[role_key]
-        ans = Answer(question=sql, role=role.label, planner_used="(hand-written SQL)")
+        ans = Answer(question=sql, role=role.label, planner_used="(hand-written SQL)", user=user)
         t0 = time.perf_counter()
         try:
             self._free_sql(Plan(intent="free_sql", sql=sql), role, ans)
@@ -356,6 +438,57 @@ class AnalystEngine:
 
     def _fact(self, ans: Answer, text: str, *recs: QueryRecord) -> None:
         ans.facts.append({"text": text, "evidence": [r.query_id for r in recs]})
+
+    def _outcome_split(self, plan: Plan, role: Role, ans: Answer, d: float) -> None:
+        """Technical vs business: the first cut in any success-rate review. Technical failures (timeouts,
+        downtime) are ours or a partner's to fix; business declines (funds, drop-off, risk/issuer policy)
+        are not. Splits the change exactly: dSR = -(d technical + d business + d pending)."""
+        p2 = copy.deepcopy(plan)
+        p2.metric = "attempts"
+        df, rec = self._run(ans, role, compiler.two_period_segments(p2, ["decline_type"]),
+                            "Outcome split: technical failures vs business declines")
+        pv = df.pivot_table(index="segment", columns="period", values="denom", aggfunc="sum", fill_value=0)
+        if not {"baseline", "current"} <= set(pv.columns):
+            return
+        tot = pv.sum()
+        share = pv / tot
+        get = lambda k, per: float(share.loc[k, per]) if k in share.index else 0.0  # noqa: E731
+        d_tech = get("technical failure", "current") - get("technical failure", "baseline")
+        d_bus = get("business decline", "current") - get("business decline", "baseline")
+        d_pen = get("pending", "current") - get("pending", "baseline")
+
+        def tsr(per):
+            succ = float(pv.loc["success", per]) if "success" in pv.index else 0.0
+            bus = float(pv.loc["business decline", per]) if "business decline" in pv.index else 0.0
+            return succ / max(float(tot[per]) - bus, 1)
+        ans.tables["Outcome split (share of attempts)"] = (share * 100).round(2).reset_index()
+        sign = -1 if plan.metric != "failure_rate" else 1
+        parts = (f"technical failures {pts(sign * d_tech)}, business declines {pts(sign * d_bus)}"
+                 + (f", pending {pts(sign * d_pen)}" if plan.metric != "failure_rate" else ""))
+        self._fact(ans, f"By outcome type, the change splits into {parts}. Technical failure rate "
+                   f"{get('technical failure', 'baseline'):.2%} → {get('technical failure', 'current'):.2%}; "
+                   f"business decline rate {get('business decline', 'baseline'):.2%} → "
+                   f"{get('business decline', 'current'):.2%}; technical success rate (excludes business "
+                   f"declines) {tsr('baseline'):.2%} → {tsr('current'):.2%}.", rec)
+        total = abs(d_tech) + abs(d_bus)
+        if total < 0.001:
+            return
+        if abs(d_tech) >= 2 * abs(d_bus):
+            ans.hypotheses.append("The movement is mainly technical failures (timeouts, issuer or network "
+                                  "downtime), not customer behaviour. That can be a genuine outage or more traffic "
+                                  "on routes that time out more often (a mix effect); the segment analysis below "
+                                  "separates the two.")
+            ans.recommendations.insert(0, "The lever is technical: routing, retries and issuer/acquirer uptime for the "
+                                          "segments identified below, whether the cause is mix or a real outage.")
+        elif abs(d_bus) >= 2 * abs(d_tech):
+            ans.hypotheses.append("The movement is mainly business declines (insufficient funds, customer "
+                                  "drop-off, risk or issuer policy): not an infrastructure problem.")
+            ans.recommendations.insert(0, "Look at customer mix, checkout drop-off and risk-rule changes; "
+                                          "infrastructure changes will not recover these declines.")
+        else:
+            ans.hypotheses.append("Both technical failures and business declines moved; treat them separately "
+                                  "(engineering for the technical part, product and risk for the business part).")
+        ans.steps.append(Step("outcome_split", "ok", parts))
 
     def _premise_check(self, ans: Answer, label: str, delta: float, rec: QueryRecord) -> None:
         """Say so plainly when the question assumes the wrong direction ("why did GMV drop" when it rose)."""
@@ -402,6 +535,8 @@ class AnalystEngine:
         self._fact(ans, ans.headline + f" 95% CI for the change: {pts(lo)} to {pts(hi)}; "
                    f"attempts {na:,.0f} → {nb:,.0f} ({(nb / na - 1):+.0%}).", q_head)
         ans.steps.append(Step("headline", "ok", ans.headline))
+        if plan.metric in ("success_rate", "failure_rate", "technical_success_rate"):
+            self._outcome_split(plan, role, ans, d)
 
         if abs(d) < 0.002 or (lo < 0 < hi):
             ans.hypotheses.append("The change is within normal noise; there is no material movement to explain.")
@@ -719,6 +854,19 @@ class AnalystEngine:
         else:
             ans.headline = f"Query returned {len(df)} row(s)."
         self._fact(ans, ans.headline + " Values are shown exactly as returned.", rec)
+        try:
+            where = sqlglot.parse_one(plan.sql, read="duckdb").find(exp.Where)
+        except sqlglot.errors.ParseError:
+            where = None
+        if where is not None:
+            conds, stack = [], [where.this]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, exp.And):
+                    stack += [node.right, node.left]
+                else:
+                    conds.append(node.sql(dialect="duckdb"))
+            self._fact(ans, "Conditions applied by this query: " + "; ".join(f"`{c}`" for c in conds) + ".", rec)
         vague = [g.split(": ", 1)[-1].strip("'") for g in unmodelled_conditions(ans.question)
                  if g.startswith("vague threshold")]
         if vague:

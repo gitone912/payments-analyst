@@ -6,14 +6,18 @@ engine's compiler), then compared with what the engine answers. Also checks beha
 clarification, access denials, guard blocks and planted-driver detection.
 
     python evals/run_evals.py            # deterministic planner
+    Exit codes: 0 all passed, 1 at least one wrong answer, 3 only model-provider errors remain
+    (after EVAL_PROVIDER_RETRIES retries with EVAL_PROVIDER_BACKOFF_S backoff).
     LLM_PROVIDER=gemini GEMINI_API_KEY=... python evals/run_evals.py --planner llm
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -22,6 +26,26 @@ import duckdb  # noqa: E402
 from analyst.engine import AnalystEngine  # noqa: E402
 
 DB = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
+
+
+PROVIDER_RETRIES = int(os.getenv("EVAL_PROVIDER_RETRIES", "2"))
+PROVIDER_BACKOFF_S = float(os.getenv("EVAL_PROVIDER_BACKOFF_S", "20"))
+
+
+def is_provider_error(a) -> bool:
+    return a.status == "error" and "provider unavailable" in a.message
+
+
+def ask_retrying(eng, *args, **kwargs):
+    """Model providers return transient 429/503s. The eval measures answers, not provider uptime, so a
+    provider error is retried after a backoff; only one that persists is reported (as PROVIDER)."""
+    a = eng.ask(*args, **kwargs)
+    for attempt in range(PROVIDER_RETRIES):
+        if not is_provider_error(a):
+            break
+        time.sleep(PROVIDER_BACKOFF_S * (attempt + 1))
+        a = eng.ask(*args, **kwargs)
+    return a
 
 
 def truth(con, sql):
@@ -60,6 +84,16 @@ def main(planner: str, paraphrases: bool = False):
     T_WEEKEND_LW = sr(clean, "2026-10-24", "2026-10-25")
     T_UPI_LW = sr(clean, "2026-10-19", "2026-10-25", "|AND t.method_id='UPI'")
     T_UPI_PW = sr(clean, "2026-10-12", "2026-10-18", "|AND t.method_id='UPI'")
+
+    def share(a, b, cond):
+        return truth(con, f"""SELECT AVG(({cond})::INT) FROM {clean}
+            WHERE created_at >= DATE '{a}' AND created_at < DATE '{b}' + 1""")
+    tech = "status = 'FAILED' AND failure_reason IN ('TIMEOUT', 'BANK_DOWNTIME')"
+    bus = "status = 'FAILED' AND failure_reason NOT IN ('TIMEOUT', 'BANK_DOWNTIME')"
+    T_TECH_PTS = -(share("2026-10-19", "2026-10-25", tech) - share("2026-10-12", "2026-10-18", tech)) * 100
+    T_BUS_PTS = -(share("2026-10-19", "2026-10-25", bus) - share("2026-10-12", "2026-10-18", bus)) * 100
+    T_TSR_DELTA_LW = truth(con, f"""SELECT SUM((status = 'SUCCESS')::INT) * 1.0 / SUM(CASE WHEN {bus} THEN 0 ELSE 1 END)
+        FROM {clean} WHERE bank_id = 'B04' AND created_at >= DATE '2026-10-19' AND created_at < DATE '2026-10-26'""")
 
     def result_has(a, target, tol):
         """Any numeric cell in the first row of a free-SQL result equals target (shares also as %)."""
@@ -146,6 +180,20 @@ def main(planner: str, paraphrases: bool = False):
          (a.status == "answered" and (a.plan or {}).get("intent") == "free_sql"
           and any("no standard definition" in c for c in a.caveats)),
          "vague threshold never silently ignored; definition disclosed"),
+        ("outcome_split", "Why did success rate drop last week?", "head_of_payments",
+         lambda a: any(f"technical failures {T_TECH_PTS:+.2f} pts" in f["text"]
+                       and f"business declines {T_BUS_PTS:+.2f} pts" in f["text"] for f in a.facts)
+         and any("mainly technical" in h for h in a.hypotheses),
+         f"splits the drop: technical {T_TECH_PTS:+.2f} pts vs business {T_BUS_PTS:+.2f} pts"),
+        ("technical_sr", "Technical success rate by bank last week", "head_of_payments",
+         lambda a: a.status == "answered" and abs(a.tables[next(iter(a.tables))].set_index("bank")
+                                                   .technical_success_rate["Delta Co-op Bank"] - T_TSR_DELTA_LW) < 2e-4,
+         f"technical success rate excludes business declines (Delta Co-op {T_TSR_DELTA_LW:.2%})"),
+        ("unknown_term", "Success rate for premium customers last week", "head_of_payments",
+         lambda a: (a.status == "clarify" and "premium" in a.message) if planner == "rules" else
+         (a.status == "clarify" or (a.plan or {}).get("intent") == "free_sql"
+          or "premium" in json.dumps(a.plan or {}).lower() or a.confidence.get("level") == "low"),
+         "an unrecognised word is never silently ignored"),
         ("hour_labels", "Success rate by hour of day last week", "head_of_payments",
          lambda a: a.status == "answered" and str(a.tables[next(iter(a.tables))].iloc[0, 0]) == "00:00",
          "hours shown as HH:00"),
@@ -155,6 +203,7 @@ def main(planner: str, paraphrases: bool = False):
         ("guard_multi", "SELECT 1; DROP TABLE banks", "blocked"),
         ("guard_file", "SELECT * FROM read_csv_auto('/etc/passwd')", "blocked"),
         ("guard_schema", "SELECT COUNT(*) FROM raw.transactions", "blocked"),
+        ("guard_unlisted_fn", "SELECT current_setting('threads')", "blocked"),
         ("guard_cartesian", "SELECT COUNT(*) FROM transactions a, transactions b", "blocked"),
         ("guard_star_pii", "SELECT * FROM transactions", "denied"),
         ("guard_ok", "SELECT COUNT(*) AS n FROM transactions", "answered"),
@@ -165,15 +214,16 @@ def main(planner: str, paraphrases: bool = False):
     total = len(cases) + len(sql_cases) + 1
     cache = {}
     for cid, q, role, check, desc in cases:
-        a = cache.get((q, role)) or eng.ask(q, role, planner)
-        cache[(q, role)] = a
+        a = cache.get((q, role)) or ask_retrying(eng, q, role, planner)
+        if not is_provider_error(a):
+            cache[(q, role)] = a
         try:
             ok = bool(check(a))
         except Exception as e:  # noqa: BLE001
             ok = False
             desc += f" [check error: {e}]"
         passed += ok
-        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_err = is_provider_error(a)
         provider_errs += (not ok) and provider_err
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}" + ("  [model provider error, not a wrong answer]" if tag == "PROVIDER" else ""))
@@ -188,15 +238,15 @@ def main(planner: str, paraphrases: bool = False):
     ]
     total += len(followups)
     for cid, q1, q2, check, desc in followups:
-        first = cache.get((q1, "head_of_payments")) or eng.ask(q1, "head_of_payments", planner)
-        a = eng.ask(q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
+        first = cache.get((q1, "head_of_payments")) or ask_retrying(eng, q1, "head_of_payments", planner)
+        a = ask_retrying(eng, q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
         try:
             ok = bool(check(a))
         except Exception as e:  # noqa: BLE001
             ok = False
             desc += f" [check error: {e}]"
         passed += ok
-        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_err = is_provider_error(a)
         provider_errs += (not ok) and provider_err
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}")
@@ -219,7 +269,12 @@ def main(planner: str, paraphrases: bool = False):
                                          if provider_errs else ""))
     if paraphrases:
         run_paraphrases(eng, planner)
-    return 0 if passed == total else 1
+    if passed == total:
+        return 0
+    if passed + provider_errs == total:
+        print("Only model-provider errors remain (no wrong answers). Exit code 3: retry later or use a paid key.")
+        return 3
+    return 1
 
 
 # Held-out rewordings: never used to write the planner prompt. They check the plan shape
@@ -248,7 +303,7 @@ def run_paraphrases(eng, planner):
     print("\nHeld-out paraphrases (plan shape):")
     ok_n = 0
     for q, status, exp in PARAPHRASES:
-        a = eng.ask(q, "head_of_payments", planner)
+        a = ask_retrying(eng, q, "head_of_payments", planner)
         p = a.plan or {}
         why = []
         if a.status != status:
