@@ -19,9 +19,10 @@ each kept separate.
 pip install -r requirements.txt
 python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
 streamlit run app.py                    # UI at http://localhost:8501
-python evals/run_evals.py               # 32 known-answer / safety checks
-python -m pytest -q tests               # 9 unit tests
+python evals/run_evals.py               # 36 known-answer / safety checks
+python -m pytest -q tests               # 14 unit tests
 python cli.py "why did success rate drop last week?" --sql
+python cli.py "why did success rate drop last week?" --then "now break that down by bank"
 ```
 
 Optional LLM planner (the system runs fully without one):
@@ -96,6 +97,14 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
   different question with full confidence. A coverage guard detects this (regex detector + the
   model's own `unsupported` list) and re-plans as model-written SQL, which goes through the same
   guard, or asks the user. It never answers while ignoring the condition.
+  Word conditions count too: weekends, time of day, "high-value"/"big transactions", and new or
+  returning customers. When the model picks a cut-off for a vague term, the definition goes into
+  the headline and a caveat.
+- **Period check on LLM plans.** The dates a model's plan (or SQL) uses must lie inside the period
+  the question names. A plan that answers "weekends last week" with 18-19 Oct is sent back once
+  with the error; if it is still wrong, the deterministic planner takes over.
+- **Follow-ups.** "Now break that down by bank" / "what about UPI?" keep the previous question's
+  metric, period, filters and analysis type (both planners). Standalone questions ignore it.
 - **Premise check.** "Why did GMV drop?" when GMV rose is answered with
   "Premise check: ... it actually rose" before the numbers.
 - **LLM robustness**: tolerant JSON parsing (trailing commas), one retry with the validation
@@ -108,15 +117,16 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
 
 Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
 
-| Planner | Core suite (32 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
+| Planner | Core suite (36 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
 |---|---|---|
-| Deterministic rules | 32/32 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
-| Gemini `gemini-3.5-flash-lite` (live) | 32/32 | 9/10. The miss was HTTP 503 from the provider; every plan the model returned was correct |
+| Deterministic rules | 36/36 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
+| Gemini `gemini-3.5-flash-lite` (live) | 34/36 on the last full run, with the 2 misses being provider 503s; both pass when re-run | 10/10 |
 
-The core suite includes two questions the catalog can't express ("share of transactions above
-5000 INR", "failed UPI transactions over 2000 INR"). With the LLM, the model writes SQL that
-matches the hand-written ground truth exactly. Without it, the engine asks instead of answering
-a different question. The eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
+The core suite includes questions the catalog can't express: amount thresholds, "on weekends",
+and "high-value". With the LLM, the model writes SQL that matches the hand-written ground truth
+exactly. Without it, the engine asks instead of answering a different question. Two follow-up
+cases ("now break that down by bank", "what about UPI?") check that context carries over. The
+eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
 
 The paraphrases were written after the prompt was finalised and are not used as prompt examples.
 They show whether the planner generalises beyond the questions it was tuned against.

@@ -57,6 +57,10 @@ def main(planner: str, paraphrases: bool = False):
     T_UPI_FAIL_2K = truth(con, f"""SELECT COUNT(*) FROM {clean} WHERE method_id = 'UPI' AND status = 'FAILED'
         AND amount_inr > 2000 AND created_at >= DATE '2026-10-01' AND created_at < DATE '2026-11-01'""")
 
+    T_WEEKEND_LW = sr(clean, "2026-10-24", "2026-10-25")
+    T_UPI_LW = sr(clean, "2026-10-19", "2026-10-25", "|AND t.method_id='UPI'")
+    T_UPI_PW = sr(clean, "2026-10-12", "2026-10-18", "|AND t.method_id='UPI'")
+
     def result_has(a, target, tol):
         """Any numeric cell in the first row of a free-SQL result equals target (shares also as %)."""
         df = a.tables.get("Result")
@@ -134,6 +138,14 @@ def main(planner: str, paraphrases: bool = False):
          "corrects a false premise (GMV rose)"),
         ("action_question", "What action should we take on success rate last week?", "head_of_payments",
          lambda a: a.status == "answered" and len(a.recommendations) >= 2, "returns recommendations"),
+        ("word_cond_weekend", "What was the success rate on weekends last week?", "head_of_payments",
+         lambda a: custom_condition(a, T_WEEKEND_LW, 2e-4, "weekends"),
+         f"weekend condition applied inside last week, 24-25 Oct ({T_WEEKEND_LW:.2%})"),
+        ("word_cond_vague", "Success rate for high-value payments last week", "head_of_payments",
+         lambda a: (a.status == "clarify" and "high-value" in a.message) if planner == "rules" else
+         (a.status == "answered" and (a.plan or {}).get("intent") == "free_sql"
+          and any("no standard definition" in c for c in a.caveats)),
+         "vague threshold never silently ignored; definition disclosed"),
         ("hour_labels", "Success rate by hour of day last week", "head_of_payments",
          lambda a: a.status == "answered" and str(a.tables[next(iter(a.tables))].iloc[0, 0]) == "00:00",
          "hours shown as HH:00"),
@@ -165,6 +177,29 @@ def main(planner: str, paraphrases: bool = False):
         provider_errs += (not ok) and provider_err
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}" + ("  [model provider error, not a wrong answer]" if tag == "PROVIDER" else ""))
+    followups = [
+        ("followup_breakdown", "Why did success rate drop last week?", "Now break that down by bank",
+         lambda a: a.status == "answered" and abs(a.tables[next(iter(a.tables))].set_index("bank")
+                                                   .success_rate["Delta Co-op Bank"] - T_DELTA_LW) < 2e-4,
+         f"keeps metric + period from the previous question (Delta Co-op {T_DELTA_LW:.2%})"),
+        ("followup_slice", "Why did success rate drop last week?", "What about UPI?",
+         lambda a: a.status == "answered" and close(pcts(a.headline), T_UPI_LW) and close(pcts(a.headline), T_UPI_PW),
+         f"re-runs the diagnosis on UPI only ({T_UPI_PW:.2%} -> {T_UPI_LW:.2%})"),
+    ]
+    total += len(followups)
+    for cid, q1, q2, check, desc in followups:
+        first = cache.get((q1, "head_of_payments")) or eng.ask(q1, "head_of_payments", planner)
+        a = eng.ask(q2, "head_of_payments", planner, previous={"question": q1, "plan": first.plan})
+        try:
+            ok = bool(check(a))
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            desc += f" [check error: {e}]"
+        passed += ok
+        provider_err = a.status == "error" and "provider unavailable" in a.message
+        provider_errs += (not ok) and provider_err
+        tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
+        print(f"{tag:<8}  {cid:<22} {desc}")
     for cid, sql, expect in sql_cases:
         a = eng.run_sql(sql, "head_of_payments")
         ok = a.status == expect

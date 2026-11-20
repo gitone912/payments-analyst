@@ -88,6 +88,8 @@ Intents (pick exactly one):
   single number ("what was the success rate in September" -> dimensions []), for "X by bank",
   for "for <merchant>" (filter + that dimension), and for comparing segments with each other
   ("UPI vs Card" -> dimensions ["method"], filters {{"method": ["UPI", "Card"]}}).
+  Hour of day, day and week are catalog dimensions: "by hour of day" -> breakdown with dimensions
+  ["hour"], not free_sql.
 - trend: ONLY when the user asks for a daily/weekly trend or a metric "over time". dimensions [] (day is implied).
 - compare_sources: ONLY for transactions vs settlements (finance) reconciliation: "do settlements
   agree", "finance numbers differ", "reconcile". Never for comparing segments or periods.
@@ -97,6 +99,10 @@ Intents (pick exactly one):
   (including the time window on created_at), and give result columns clear names
   (e.g. share_above_5000, txn_count). Express shares as a fraction between 0 and 1.
   Never select customer_vpa unless the question asks for customers.
+  Day-of-week ("weekends") and time-of-day ("9am to 5pm", "evenings") conditions also need free_sql
+  (e.g. dayofweek(created_at) IN (0, 6), hour(created_at) BETWEEN 9 AND 16), still inside the period asked.
+  For vague terms with no standard definition ("high-value", "big transactions", "peak hours"), pick a
+  concrete definition and state it in "assumptions" (e.g. "high-value = amount_inr > 10000").
 - clarify: ONLY when (a) a change/why question gives no time period at all, or (b) the measure is
   genuinely unclear ("how are we performing", "how are we doing"). Give 2-4 concrete options.
   A missing dimension is NOT a reason to clarify.
@@ -117,6 +123,9 @@ Other rules:
 - "failures"/"most failures" -> metric failure_rate. Customer / VPA questions -> dimension customer_vpa
   (access control is handled by the engine; just plan it).
 - Record every interpretation you made in "assumptions".
+- Follow-ups: if a previous question and plan are given and the new question refers to them ("that",
+  "it", "what about UPI", "now by bank"), keep the previous metric, window, baseline, filters and intent
+  unless the new question changes them. "Break that down by X" -> breakdown by X over the same period.
 - "unsupported": list every condition in the question that your plan does NOT apply. A catalog intent
   with a non-empty "unsupported" list is wrong: use free_sql (or clarify) instead. Normally [].
 
@@ -246,14 +255,16 @@ class LLMPlanner:
         raise ProviderUnavailable("no LLM provider configured")
 
     # ------------------------------------------------------------- planning
-    def plan(self, question: str, feedback: str | None = None) -> LLMResult:
+    def plan(self, question: str, feedback: str | None = None, context: str | None = None) -> LLMResult:
         res = LLMResult(plan=None)
-        ck = " ".join(question.lower().split()) + (f" || {feedback}" if feedback else "")
+        ck = (" ".join(question.lower().split()) + (f" || {feedback}" if feedback else "")
+              + (f" || {context}" if context else ""))
         if ck in self._cache and not self.simulate_outage:
             res.plan = copy.deepcopy(self._cache[ck])
             res.calls.append(LLMCall(self.provider, self.model, 0, 0.0, 0, 0, 0.0, True, cached=True))
             return res
-        user = f"Question: {question}" + (f"\n\n{feedback}" if feedback else "")
+        user = ((f"{context}\n\n" if context else "") + f"Question: {question}"
+                + (f"\n\n{feedback}" if feedback else ""))
         pin, pout = PRICES.get(self.model, PRICES["default"])
         for attempt in range(1, self.max_attempts + 1):
             t0 = time.perf_counter()
@@ -275,8 +286,8 @@ class LLMPlanner:
                 res.calls.append(LLMCall(self.provider, self.model, attempt, ms, ti, to, cost, False,
                                          f"invalid plan: {e}"))
                 res.errors.append(f"attempt {attempt}: invalid plan ({e})")
-                user = (f"Question: {question}\n\nYour previous output was rejected: {e}.\n"
-                        f"Return a corrected JSON object only.")
+                user = ((f"{context}\n\n" if context else "") + f"Question: {question}\n\n"
+                        f"Your previous output was rejected: {e}.\nReturn a corrected JSON object only.")
                 continue
             res.calls.append(LLMCall(self.provider, self.model, attempt, ms, ti, to, cost, True))
             res.plan = plan

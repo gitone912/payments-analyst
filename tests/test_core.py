@@ -91,7 +91,7 @@ def test_ambiguity_guard_overrides_llm_guess():
     eng.llm.provider = "gemini"
     guess = Plan(intent="breakdown", metric="success_rate",
                  window=Window(date(2026, 10, 19), date(2026, 10, 25)))
-    eng.llm.plan = lambda q: LLMResult(plan=guess)
+    eng.llm.plan = lambda q, **kw: LLMResult(plan=guess)
     plan = eng.make_plan("How are we performing last week?", Answer("q", "r"), "llm")
     assert plan.intent == "clarify"
 
@@ -110,3 +110,86 @@ def test_premise_direction():
     assert d("Why did GMV drop last week?") == "down"
     assert d("Why did failure rate go up?") == "up"
     assert d("What drove the change?") is None
+
+
+def _engine():
+    from analyst.engine import AnalystEngine
+    db = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
+    if not os.path.exists(db):
+        import pytest
+        pytest.skip("run data/generate_data.py first")
+    return AnalystEngine(db)
+
+
+def test_word_conditions_detected():
+    from analyst.rule_planner import unmodelled_conditions as u
+    for q in ("Success rate for high-value payments last week", "Success rate on weekends last week",
+              "Success rate between 9am and 5pm last week", "Success rate for first-time customers"):
+        assert u(q), q
+    for q in ("Success rate by hour of day last week", "Daily success rate trend for October"):
+        assert not u(q), q
+
+
+def test_period_guard_rejects_wrong_llm_window():
+    """'weekends last week' answered with 18-19 Oct (Sun+Mon, outside last week) must not get through."""
+    from analyst.engine import Answer
+    from analyst.llm import LLMResult
+    from analyst.plan import Plan
+    eng = _engine()
+    eng.llm.provider = "gemini"
+    wrong = Plan(intent="free_sql", sql="SELECT COUNT(*) FROM transactions WHERE created_at >= '2026-10-18' "
+                                        "AND created_at < '2026-10-20' AND dayofweek(created_at) IN (0, 6)")
+    right = Plan(intent="free_sql", sql="SELECT COUNT(*) FROM transactions WHERE created_at >= '2026-10-24' "
+                                        "AND created_at < '2026-10-26'")
+    calls = []
+
+    def fake(q, feedback=None, context=None):
+        calls.append(feedback)
+        return LLMResult(plan=right if feedback and "period check" in feedback else wrong)
+    eng.llm.plan = fake
+    ans = Answer("q", "r")
+    ans.planner_used = "LLM"
+    plan = eng._period_guard("Success rate on weekends last week", wrong, ans, "llm")
+    assert plan.sql == right.sql and any(s.name == "period_check" and s.status == "fixed" for s in ans.steps)
+
+    eng.llm.plan = lambda q, **kw: LLMResult(plan=wrong)  # model never fixes it -> deterministic fallback
+    ans = Answer("q", "r")
+    plan = eng._period_guard("Success rate on weekends last week", wrong, ans, "llm")
+    assert plan.intent == "clarify"  # rules can't do weekends, so they ask rather than guess
+
+
+def test_followup_inherits_previous_plan():
+    eng = _engine()
+    first = eng.ask("Why did success rate drop last week?", "head_of_payments", "rules")
+    prev = {"question": first.question, "plan": first.plan}
+    a = eng.ask("Now break that down by bank", "head_of_payments", "rules", previous=prev)
+    assert a.status == "answered" and a.plan["dimensions"] == ["bank"]
+    assert a.plan["window"] == first.plan["window"] and a.plan["metric"] == "success_rate"
+    b = eng.ask("What about UPI?", "head_of_payments", "rules", previous=prev)
+    assert b.plan["intent"] == "diagnose_change" and b.plan["filters"] == {"method": ["UPI"]}
+    # a standalone question ignores the previous plan
+    c = eng.ask("Success rate by method in September", "head_of_payments", "rules", previous=prev)
+    assert c.plan["window"]["start"] == "2026-09-01"
+
+
+def test_vague_threshold_definition_is_surfaced():
+    from analyst.engine import Answer
+    from analyst.plan import Plan
+    from analyst.rbac import ROLES
+    eng = _engine()
+    plan = Plan(intent="free_sql", assumptions=["high-value = amount_inr > 10000"],
+                sql="SELECT AVG((status = 'SUCCESS')::FLOAT) AS success_rate FROM transactions "
+                    "WHERE amount_inr > 10000 AND created_at >= '2026-10-19' AND created_at < '2026-10-26'")
+    ans = Answer("Success rate for high-value payments last week", "r")
+    eng._free_sql(plan, ROLES["head_of_payments"], ans)
+    assert "amount_inr > 10000" in ans.headline and "%" in ans.headline  # formatted, not 0.927...
+    assert any("no standard definition" in c for c in ans.caveats)
+
+
+def test_amount_is_not_read_as_year():
+    from analyst.rule_planner import RulePlanner
+    r = RulePlanner(date(2026, 8, 31), date(2026, 10, 25), [], [], [])
+    w, _, _ = r.parse_time(" how many failed upi transactions over 2000 inr in october ")
+    assert (w.start, w.end) == (date(2026, 10, 1), date(2026, 10, 25))
+    w, _, _ = r.parse_time(" success rate in march 2025 ")
+    assert w.start == date(2025, 3, 1)

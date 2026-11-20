@@ -49,7 +49,18 @@ _CONDITION_PATTERNS = [
     (r"\b(?:distinct|unique)\s+\w+", "distinct count"),
     (r"\b(?:median|percentile|p\d{2})\b", "percentile"),
     (r"\brepeat (?:customers?|payers?|users?)\b", "repeat-customer logic"),
+    (r"\b(?:weekends?|weekdays?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|saturdays?|sundays?)\b",
+     "day of week"),
+    (r"\bbetween\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+and\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b"
+     r"|\b(?:before|after|from)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+     r"|\b(?:mornings?|afternoons?|evenings?|nights?|overnight|business hours|office hours|peak hours|off[- ]peak)\b",
+     "time of day"),
+    (r"\b(?:high|low)[- ]value\b|\b(?:large|small|big|high|low)[- ](?:ticket|value|amount)s?\b"
+     r"|\b(?:large|small|big) (?:payments?|transactions?|txns?)\b|\bbig[- ]ticket\b|\bmicro[- ]?payments?\b",
+     "vague threshold"),
+    (r"\b(?:first[- ]time|new|returning|repeat) (?:customers?|users?|payers?)\b", "customer cohort"),
 ]
+NUMERIC_KINDS = {"numeric threshold", "numeric range"}
 
 
 def unmodelled_conditions(question: str) -> list[str]:
@@ -61,9 +72,11 @@ def unmodelled_conditions(question: str) -> list[str]:
     for pat, kind in _CONDITION_PATTERNS:
         for m in re.finditer(pat, q):
             txt = m.group(0).strip()
-            if not re.search(r"\d|distinct|unique|median|percentile|repeat", txt):
+            if kind in NUMERIC_KINDS and not re.search(r"\d", txt):
                 continue
-            found.append(f"{kind}: '{txt}'")
+            item = f"{kind}: '{txt}'"
+            if item not in found:
+                found.append(item)
     return found
 
 
@@ -80,6 +93,15 @@ def premise_direction(question: str) -> str | None:
     if up and not down:
         return "up"
     return None
+
+
+_FOLLOWUP = (r"^\s*(?:and|now|then|also|ok(?:ay)?|what about|how about|same|instead)\b"
+             r"|\b(?:that|it|those|them|these|same)\b|\bbreak (?:it|that|this) down\b|\bdrill (?:in|down)\b")
+
+
+def is_followup(question: str) -> bool:
+    """Does the question lean on the previous one ("now break that down by bank", "what about UPI")?"""
+    return bool(re.search(_FOLLOWUP, question.lower()))
 
 
 METRIC_CLARIFICATION = {
@@ -119,6 +141,17 @@ class RulePlanner:
         n = w.days()
         return Window(w.start - timedelta(days=n), w.start - timedelta(days=1))
 
+    @staticmethod
+    def _year(q: str):
+        """A year like 2025, but not an amount ("over 2000 INR", "₹2025", "2000 rupees")."""
+        for m in re.finditer(r"\b(20\d{2})\b", q):
+            before, after = q[:m.start()][-20:], q[m.end():m.end() + 10]
+            if re.search(r"(?:above|over|below|under|than|least|most|exceeding|between|and|[<>=₹]|rs\.?|inr)\s*$",
+                         before) or re.match(r"\s*(?:inr|rupees|rs\b|k\b|lakh|,\d)", after):
+                continue
+            return m
+        return None
+
     def parse_time(self, q: str) -> tuple[Window | None, Window | None, list[str]]:
         notes: list[str] = []
         ref = self.data_end
@@ -151,7 +184,7 @@ class RulePlanner:
             end = ref.replace(day=1) - timedelta(days=1)
             w = Window(end.replace(day=1), end)
             return w, self._prev(w), notes
-        yr = re.search(r"\b(20\d{2})\b", q)
+        yr = self._year(q)
         year = int(yr.group(1)) if yr else ref.year
         found = [(MONTHS[mo], mo) for mo in MONTHS if re.search(rf"\b{mo}\b|\b{mo[:3]}\b", q)]
         if yr and not found:
@@ -178,8 +211,12 @@ class RulePlanner:
         return None, None, notes
 
     # ----------------------------------------------------------------- main
-    def plan(self, question: str) -> Plan:
+    def plan(self, question: str, previous: Plan | None = None) -> Plan:
+        """previous: the last answered plan, used only when the question is a follow-up."""
+        prev = previous if previous is not None and is_followup(question) else None
         q = " " + question.lower().strip() + " "
+        # "break that down" is a breakdown request, not a "why did it go down" question
+        q = re.sub(r"\bbreak(?:s|ing)? (?:it |that |this |them )?down\b", " breakdown ", q)
         window, baseline, notes = self.parse_time(q)
         assumptions = list(notes)
 
@@ -197,7 +234,7 @@ class RulePlanner:
             metric = "avg_ticket"
         elif re.search(r"how many|volume|count|number of (transactions|payments|attempts)|attempts", q):
             metric = "attempts"
-        elif metric_ambiguity(question):
+        elif prev is None and metric_ambiguity(question):
             return metric_ambiguity(question)
 
         # intent
@@ -210,6 +247,21 @@ class RulePlanner:
             intent = "trend"
         else:
             intent = "breakdown"
+
+        if prev is not None:
+            inherited = []
+            if metric is None:
+                metric = prev.metric
+                inherited.append("metric")
+            if window is None and prev.window is not None:
+                window, baseline = prev.window, prev.baseline
+                inherited.append("period")
+            if intent == "breakdown" and prev.intent in ("diagnose_change", "trend") \
+                    and not re.search(r"\bbreakdown\b|\bby\b", q):
+                intent = prev.intent  # "what about UPI?" re-runs the same analysis on a new slice
+                inherited.append("analysis type")
+            if inherited:
+                assumptions.append(f"Follow-up to the previous question: kept its {', '.join(inherited)}.")
 
         if metric is None:
             if intent == "diagnose_change" and re.search(r"success|fail", q):
@@ -260,7 +312,13 @@ class RulePlanner:
             if k in dims and len(filters[k]) == 1 and not re.search(rf"\bby {k}", q):
                 dims.remove(k)
 
-        use_raw = bool(re.search(r"\braw\b|including duplicates|with duplicates", q))
+        if prev is not None:
+            merged = {k: list(v) for k, v in prev.filters.items() if k not in filters}
+            if merged:
+                assumptions.append("Kept filters from the previous question: "
+                                   + ", ".join(f"{k}={'/'.join(v)}" for k, v in merged.items()) + ".")
+            filters = {**merged, **filters}
+        use_raw = bool(re.search(r"\braw\b|including duplicates|with duplicates", q)) or bool(prev and prev.use_raw)
 
         # time window handling
         if window is None:
