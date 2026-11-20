@@ -154,10 +154,10 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
 
 Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
 
-| Planner | Core suite (36 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
+| Planner | Core suite (40 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
 |---|---|---|
-| Deterministic rules | 36/36 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
-| Gemini `gemini-3.5-flash-lite` (live) | 34/36 on the last full run, with the 2 misses being provider 503s; both pass when re-run | 10/10 |
+| Deterministic rules | 40/40 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
+| Gemini `gemini-3.5-flash-lite` (live) | 32/40 on the latest run; all 8 misses were provider 503s, 0 wrong answers. The previous full run (36 checks) was 34/36, again with only provider errors | 9/10 (the miss was a 503) |
 
 The core suite includes questions the catalog can't express: amount thresholds, "on weekends",
 and "high-value". With the LLM, the model writes SQL that matches the hand-written ground truth
