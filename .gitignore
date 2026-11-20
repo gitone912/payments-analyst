@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+data/payments.duckdb
+data/payments.duckdb.wal
+.env
