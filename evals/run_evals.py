@@ -97,6 +97,10 @@ def main(planner: str, paraphrases: bool = False, save: bool = False):
     T_TSR_DELTA_LW = truth(con, f"""SELECT SUM((status = 'SUCCESS')::INT) * 1.0 / SUM(CASE WHEN {bus} THEN 0 ELSE 1 END)
         FROM {clean} WHERE bank_id = 'B04' AND created_at >= DATE '2026-10-19' AND created_at < DATE '2026-10-26'""")
 
+    T_GMV_ECOM_OCT = truth(con, f"""SELECT SUM(CASE WHEN t.status = 'SUCCESS' THEN t.amount_inr ELSE 0 END)
+        FROM {clean} t JOIN raw.merchants m USING (merchant_id) WHERE m.category = 'ecommerce'
+        AND t.created_at >= DATE '2026-10-01' AND t.created_at < DATE '2026-10-26'""")
+
     def result_has(a, target, tol):
         """Any numeric cell in the first row of a free-SQL result equals target (shares also as %)."""
         df = a.tables.get("Result")
@@ -254,6 +258,24 @@ def main(planner: str, paraphrases: bool = False, save: bool = False):
         tag = "PASS" if ok else ("PROVIDER" if provider_err else "FAIL")
         print(f"{tag:<8}  {cid:<22} {desc}")
         record(cid, tag, desc)
+    # one question with two parts: each must be answered on its own, correctly
+    total += 1
+    parts = eng.ask_parts("Success rate by bank last week and GMV by category in October", "head_of_payments", planner)
+    try:
+        ok = (len(parts) == 2 and all(x.status == "answered" for x in parts)
+              and abs(parts[0].tables[next(iter(parts[0].tables))].set_index("bank").success_rate["Delta Co-op Bank"]
+                      - T_DELTA_LW) < 2e-4
+              and abs(parts[1].tables[next(iter(parts[1].tables))].set_index("category").gmv["ecommerce"]
+                      - T_GMV_ECOM_OCT) < 1)
+    except Exception:  # noqa: BLE001
+        ok = False
+    pe = any(is_provider_error(x) for x in parts)
+    passed += ok
+    provider_errs += (not ok) and pe
+    tag = "PASS" if ok else ("PROVIDER" if pe else "FAIL")
+    desc = f"two-part question answered separately (Delta {T_DELTA_LW:.2%}; ecommerce GMV Oct ₹{T_GMV_ECOM_OCT:,.0f})"
+    print(f"{tag:<8}  {'multi_part':<22} {desc}")
+    record("multi_part", tag, desc)
     for cid, sql, expect in sql_cases:
         a = eng.run_sql(sql, "head_of_payments")
         ok = a.status == expect

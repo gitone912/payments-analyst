@@ -27,7 +27,8 @@ from .llm import LLMCall, LLMPlanner, plan_from_json
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
 from .rule_planner import (RulePlanner, is_followup, metric_ambiguity, premise_direction,
-                           unmodelled_conditions, unrecognised_terms, correct_spelling)
+                           unmodelled_conditions, unrecognised_terms, correct_spelling,
+                           split_question)
 from .semantic import DIMENSIONS, METRICS
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
@@ -398,6 +399,28 @@ class AnalystEngine:
         finally:
             ans.total_ms = (time.perf_counter() - t0) * 1000
         return ans
+
+    def ask_parts(self, question: str, role_key: str = "head_of_payments", planner_mode: str = "auto",
+                  previous: dict | None = None, *, user: str = "", simulate_outage: bool = False) -> list[Answer]:
+        """Answer a question that may contain several ("show the trend and why did it drop"): split it,
+        answer each part in order, and let each part build on the one before ("...and what about
+        failure rate?"). A single question returns a one-element list."""
+        corrected, fixes = correct_spelling(question, self.known_names)
+        parts = split_question(corrected)
+        if len(parts) == 1:
+            return [self.ask(question, role_key, planner_mode, previous, user=user, simulate_outage=simulate_outage)]
+        answers, prev = [], previous
+        for i, part in enumerate(parts, 1):
+            a = self.ask(part, role_key, planner_mode, prev, user=user, simulate_outage=simulate_outage)
+            a.steps.insert(0, Step("multi_part", "ok", f"part {i} of {len(parts)} of: {question}"))
+            if fixes:  # parts were split from the corrected text; keep the correction visible
+                note = "Read " + ", ".join(f"'{w}' as '{r}'" for w, r in fixes) + "."
+                a.steps.insert(1, Step("spelling", "ok", note))
+                a.assumptions.insert(0, note)
+            answers.append(a)
+            if a.status == "answered" and a.plan:
+                prev = {"question": a.question, "plan": a.plan}
+        return answers
 
     def run_sql(self, sql: str, role_key: str, *, user: str = "") -> Answer:
         """SQL playground: hand-written SQL gets exactly the same guard as model SQL."""

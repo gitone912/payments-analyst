@@ -41,11 +41,11 @@ if __name__ == "__main__":
     eng = AnalystEngine(DB)
     previous = None
     for question in [" ".join(a.question), *a.then]:
-        ans = eng.ask(question, a.role, a.planner, previous=previous)
         print(f"\n>>> {question}")
-        show(ans)
-        if a.sql:
-            for q in ans.queries:
-                print(f"\n-- {q.query_id} {q.purpose} ({q.ms:.0f} ms, {q.rows} rows)\n{q.sql}")
-        if ans.status == "answered":
-            previous = {"question": question, "plan": ans.plan}
+        for ans in eng.ask_parts(question, a.role, a.planner, previous=previous):
+            show(ans)
+            if a.sql:
+                for q in ans.queries:
+                    print(f"\n-- {q.query_id} {q.purpose} ({q.ms:.0f} ms, {q.rows} rows)\n{q.sql}")
+            if ans.status == "answered":
+                previous = {"question": ans.question, "plan": ans.plan}

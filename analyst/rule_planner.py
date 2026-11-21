@@ -177,6 +177,24 @@ def unrecognised_terms(question: str, extra_known: set[str] = frozenset()) -> li
     return out
 
 
+_PART_STARTERS = (r"why|what|how|which|show|give|compare|is|are|was|were|do|does|did|can|could|plot|list|"
+                  r"tell|trend|daily|weekly|monthly|gmv|tpv|success|failure|failures|attempts|avg|average|"
+                  r"technical|business|top|break|drill")
+_SPLIT = re.compile(rf"\s*;\s*|\s*,?\s+(?:and\s+also|also|and\s+then|then)\s+|\s*,?\s+and\s+(?=(?:{_PART_STARTERS})\b)",
+                    re.IGNORECASE)
+_PART_CUE = re.compile(rf"\b(?:{_PART_STARTERS}|rate|volume|ticket|settlements?)\b", re.IGNORECASE)
+
+
+def split_question(question: str) -> list[str]:
+    """'Show the daily trend and why did success rate drop last week' is two questions. Split where a
+    new question starts ('and why...', 'and GMV...', '; ...', 'also ...'); keep the question whole when
+    a piece would be too small to stand alone ('GMV and attempts by bank', 'between 9am and 5pm')."""
+    raw = [p.strip(" ?.,") for p in _SPLIT.split(question) if p and p.strip(" ?.,")]
+    if len(raw) < 2 or any(len(p.split()) < 3 or not _PART_CUE.search(p) for p in raw):
+        return [question]
+    return raw
+
+
 def correct_spelling(question: str, extra_known: set[str] = frozenset()) -> tuple[str, list[tuple[str, str]]]:
     """Fix obvious typos ("sucess", "faliure", "bnak", "Octobr") before planning. Only words the
     planner does not recognise are touched, and only when one known word is a close match, so a

@@ -140,7 +140,7 @@ st.caption("Ask about payment performance. Every number comes from an executed, 
 tab_ask, tab_sql, tab_log = st.tabs(["Ask a question", "SQL playground", "Session log"])
 
 
-def render_answer(a):
+def render_answer(a, key: str = "a"):
     spelling = next((x for x in a.steps if x.name == "spelling"), None)
     if spelling:
         st.caption(f"✏️ {spelling.detail} Answered: *{a.question}*")
@@ -152,7 +152,7 @@ def render_answer(a):
         if a.status == "clarify" and a.clarification:
             cols = st.columns(len(a.clarification.get("options", [])) or 1)
             for c, opt in zip(cols, a.clarification.get("options", [])):
-                if c.button(opt, key=f"opt_{opt}"):
+                if c.button(opt, key=f"{key}_opt_{opt}"):
                     base = a.question if not a.message.startswith("I couldn't") else ""
                     st.session_state.pending_q = (base + " " + opt).strip() if base else opt
                     st.rerun()
@@ -207,8 +207,8 @@ def render_answer(a):
                           for d in f.affected_days})
         if not a.charts:
             st.caption("No chart for this answer.")
-        for spec in a.charts:
-            st.plotly_chart(charts.render(spec, dq_days), width="stretch")
+        for i, spec in enumerate(a.charts):
+            st.plotly_chart(charts.render(spec, dq_days), width="stretch", key=f"{key}_chart_{i}")
             if spec["kind"] == "contrib":
                 st.caption("Blue = share of traffic moved toward/away from the segment. "
                            "Orange = the segment's own success rate changed.")
@@ -262,16 +262,27 @@ with tab_ask:
     if clicked and q.strip():
         with st.spinner("Planning, validating and querying..."):
             context = prev if prev and prev["role"] == role_key else None
-            ans = eng.ask(q, role_key, planner_mode, previous=context, user=user.username,
-                          simulate_outage=simulate_outage)
-            st.session_state.last = ans
-            if ans.status == "answered" and ans.plan:
-                st.session_state.prev = {"question": ans.question, "plan": ans.plan, "role": role_key}
+            answers = eng.ask_parts(q, role_key, planner_mode, previous=context, user=user.username,
+                                    simulate_outage=simulate_outage)
+            st.session_state.last = answers
+            done = [x for x in answers if x.status == "answered" and x.plan]
+            if done:  # follow-ups build on the last part that was answered
+                st.session_state.prev = {"question": done[-1].question, "plan": done[-1].plan, "role": role_key}
         # the context line and "New conversation" button are drawn above this point: redraw once so
         # they reflect the answer just stored (the answer itself is kept in session state)
         st.rerun()
     if "last" in st.session_state:
-        render_answer(st.session_state.last)
+        answers = st.session_state.last if isinstance(st.session_state.last, list) else [st.session_state.last]
+        if len(answers) == 1:
+            render_answer(answers[0])
+        else:
+            st.info(f"Your question has {len(answers)} parts, so each is answered separately. Later parts "
+                    "build on earlier ones.")
+            tabs = st.tabs([f"Part {i}: {x.question[:45]}{'…' if len(x.question) > 45 else ''}"
+                            for i, x in enumerate(answers, 1)])
+            for i, (tab, x) in enumerate(zip(tabs, answers), 1):
+                with tab:
+                    render_answer(x, key=f"p{i}")
 
 with tab_sql:
     st.caption("Hand-written SQL goes through the same guard and role scope as model-written SQL. "

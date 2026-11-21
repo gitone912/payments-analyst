@@ -420,3 +420,19 @@ def test_spelling_is_corrected_and_disclosed():
     # a genuinely unknown word is not "corrected" into something else: it still gets a question
     assert correct_spelling("Success rate for premium customers", eng.known_names)[1] == []
     assert eng.ask("Success rate for premium customers last week", "head_of_payments", "rules").status == "clarify"
+
+
+def test_multi_part_questions_are_split_and_answered_separately():
+    from analyst.rule_planner import split_question
+    # stays whole: one subject, or 'and' inside a condition or a list
+    for q in ("GMV and attempts by bank last week", "Success rate by bank and method last week",
+              "Success rate between 9am and 5pm last week", "Why did success rate drop last week?"):
+        assert split_question(q) == [q], q
+    eng = _engine()
+    a, b = eng.ask_parts("Success rate by bank last week and GMV by category in October", "head_of_payments", "rules")
+    assert (a.plan["metric"], a.plan["dimensions"]) == ("success_rate", ["bank"])
+    assert (b.plan["metric"], b.plan["dimensions"], b.plan["window"]["start"]) == ("gmv", ["category"], "2026-10-01")
+    c, d = eng.ask_parts("Why did sucess rate drop last week and what about failure rate?", "head_of_payments", "rules")
+    assert c.plan["intent"] == "diagnose_change" and d.plan["metric"] == "failure_rate"
+    assert d.plan["window"] == c.plan["window"]                       # part 2 builds on part 1
+    assert any("'sucess' as 'success'" in x for x in c.assumptions)  # correction still shown
