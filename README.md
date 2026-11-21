@@ -25,7 +25,7 @@ documented, planted scenarios so every answer can be checked against ground trut
 ---
 
 ## Contents
-[Quick start](#quick-start) · [Using the app](#using-the-app) · [Roles](#roles-and-what-each-can-run) ·
+[Quick start](#quick-start) · [Deploy](#deploy-to-streamlit-community-cloud) · [Using the app](#using-the-app) · [Roles](#roles-and-what-each-can-run) ·
 [How it works](#how-it-works) · [Failure scenarios](#failure-and-exception-scenarios) ·
 [Evaluation](#evaluation) · [Project structure](#project-structure) · [Configuration](#configuration) ·
 [Troubleshooting](#troubleshooting) · [Assumptions and limitations](#assumptions-and-limitations)
@@ -81,12 +81,37 @@ OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, Ollama, vLLM) also works:
 ### Other entry points
 
 ```bash
+pip install -r requirements-dev.txt                         # adds pytest
 python -m pytest -q tests                                   # unit tests
 python evals/run_evals.py --paraphrases                     # known-answer evals (rule planner)
 python evals/run_evals.py --planner llm --paraphrases       # the same, against the live model
 python cli.py "why did success rate drop last week?" --sql  # terminal client, prints executed SQL
 python cli.py "why did success rate drop last week?" --then "now break that down by bank"
 ```
+
+---
+
+## Deploy to Streamlit Community Cloud
+
+Free hosting straight from this GitHub repository (Vercel is not suitable: it runs short-lived
+serverless functions, while a Streamlit app is a long-running server holding a WebSocket per user).
+
+1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
+2. **Create app → Deploy a public app from GitHub**: repository `gitone912/payments-analyst`,
+   branch `main`, main file `app.py`; choose the app URL.
+3. **Advanced settings**: Python 3.12 or 3.13, and paste into **Secrets**:
+   ```toml
+   LLM_PROVIDER = "gemini"
+   GEMINI_API_KEY = "your-key"
+   LLM_MIN_INTERVAL_S = "4.5"   # free-tier keys allow 15 requests/minute
+   ```
+4. **Deploy.** The first start installs the pinned requirements, and the first page load builds the
+   database (~10 s). Leave the secrets out to run without an LLM (rule planner only).
+
+Notes: top-level secrets are copied into the environment at start-up (`app.py`), so the same
+variables as `.env` apply. The app is public: anyone with the link can sign in with the demo accounts
+and use your model quota, so use a dedicated key. Community Cloud apps sleep after inactivity and
+wake on the next visit; the audit log resets when the app restarts.
 
 ---
 
@@ -362,6 +387,7 @@ Set in `.env` (see `.env.example`) or the environment; values already set in the
 | Sign-in fails for every account | `python -m analyst.auth check`; if the browser autofilled the fields, type them instead |
 | Ctrl+C hangs on "Stopping…" | Start with `python run_app.py`, which always stops within 5 s |
 | Answers look stale after `git pull` | Stop and restart the app |
+| Deployed app says **LLM off** | Add `LLM_PROVIDER` and `GEMINI_API_KEY` under the app's *Settings → Secrets*, then reboot the app |
 
 ---
 

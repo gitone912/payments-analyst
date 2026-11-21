@@ -13,6 +13,19 @@ import streamlit as st
 
 from analyst.config import load_env
 
+
+def _secrets_to_env() -> None:
+    """On Streamlit Community Cloud the LLM key is set in the app's Secrets screen, not a .env file.
+    Copy top-level secrets into the environment (values already set there win)."""
+    try:
+        for key, value in st.secrets.items():
+            if isinstance(value, (str, int, float, bool)) and key not in os.environ:
+                os.environ[key] = str(value)
+    except Exception:  # noqa: BLE001  no secrets file: local run, .env is used instead
+        pass
+
+
+_secrets_to_env()
 load_env()  # .env in the project folder (LLM key etc.); must run before the engine is built
 
 from analyst.auth import auth_mode, user_from_headers  # noqa: E402
