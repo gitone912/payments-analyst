@@ -1,207 +1,274 @@
 # Payments AI Business Analyst
 
-Ask a question about payment performance in plain English. The system plans an analysis,
-validates the SQL, runs it against payments data, breaks the change down by segment,
-and answers with **facts (with query evidence), hypotheses, recommendations, and caveats**,
-each kept separate.
+Ask a question about payment performance in plain English and get an answer an analyst would
+sign off on: the number, **why** it moved, what to do next, and the evidence behind every claim.
+Every figure comes from an executed, guarded SQL query; the language model only decides *what*
+to compute, never the numbers.
 
-> "Why did success rate drop last week?"
-> → Success rate fell 87.51% → 84.92% (−2.59 pts, CI −3.09 to −2.10). **86% of it is a
-> traffic-mix shift**: Delta Co-op Bank · UPI went from 2.9% to 14.4% of volume (driven by
-> QuickTix: 390 → 10,871 attempts) while its own success rate stayed flat at ~69%.
-> At last week's mix the rate would be 87.18%. Separately, **Coastal Bank · NetBanking
-> genuinely degraded** (87.8% → 81.4%, z = −3.5; top failure reason BANK_DOWNTIME).
-> Caveats: 411 duplicate rows on 20–22 Oct (de-duplicated), incomplete data on 14 Oct.
+> **"Why did success rate drop last week?"**
+>
+> Success rate fell **87.51% → 84.92% (−2.59 pts)**, 95% CI −3.09 to −2.10 pts.
+> - **Mostly technical, not customers:** technical failures −2.32 pts, business declines −0.18,
+>   pending −0.10. Technical success rate 95.08% → 92.44%.
+> - **86% of the drop is a traffic-mix shift:** Delta Co-op Bank · UPI went from 2.9% to 14.4% of
+>   volume (QuickTix: 390 → 10,871 attempts) while its own rate stayed flat (~69%). At last
+>   week's mix the rate would be **87.18%**.
+> - **One genuine degradation:** Coastal Bank · NetBanking 87.80% → 81.44% (z = −3.5), top failure
+>   reason BANK_DOWNTIME.
+> - **Caveats:** 411 duplicate rows on 20–22 Oct (de-duplicated); incomplete data on 14 Oct.
+>
+> Each finding links to the query that produced it (Q1, Q3, Q9 …).
+
+Built for the *Enterprise AI Business Analyst* challenge. Data is synthetic, generated with
+documented, planted scenarios so every answer can be checked against ground truth.
+
+---
+
+## Contents
+[Quick start](#quick-start) · [Using the app](#using-the-app) · [Roles](#roles-and-what-each-can-run) ·
+[How it works](#how-it-works) · [Failure scenarios](#failure-and-exception-scenarios) ·
+[Evaluation](#evaluation) · [Project structure](#project-structure) · [Configuration](#configuration) ·
+[Troubleshooting](#troubleshooting) · [Assumptions and limitations](#assumptions-and-limitations)
+
+---
 
 ## Quick start
 
+Requires Python 3.11+.
+
+**macOS / Linux**
 ```bash
+git clone https://github.com/gitone912/payments-analyst && cd payments-analyst
 pip install -r requirements.txt
-python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
-python run_app.py                       # UI at http://localhost:8501 (sign in: see below)
-python evals/run_evals.py               # 40 known-answer / safety checks
-python -m pytest -q tests               # 23 unit tests
-python cli.py "why did success rate drop last week?" --sql
+python data/generate_data.py        # builds data/payments.duckdb (~285k transactions, seeded, ~5 s)
+python run_app.py                   # opens http://localhost:8501
+```
+
+**Windows (cmd)**
+```bat
+git clone https://github.com/gitone912/payments-analyst && cd payments-analyst
+python -m pip install -r requirements.txt
+python data\generate_data.py
+python run_app.py
+```
+
+Sign in with a demo account (one per role):
+
+| Username | Password | Role |
+|---|---|---|
+| `head.payments` | `demo-head` | Head of Payments: all merchants, no PII |
+| `risk.ops` | `demo-risk` | Risk Ops: all merchants, PII, full technical detail |
+| `kam.a` | `demo-kam` | Key Account Manager: Portfolio A merchants only |
+
+These are demo accounts (salted PBKDF2 hashes in `config/users.demo.json`); see
+[Configuration](#configuration) for real users or single sign-on.
+
+### Turn on the LLM planner (optional)
+
+The app works fully without a model (deterministic planner). To use Gemini:
+
+```bash
+cp .env.example .env          # Windows: copy .env.example .env
+# edit .env: LLM_PROVIDER=gemini and GEMINI_API_KEY=<your key>
+python -m analyst.llm_check   # one real call per model; explains any failure in plain words
+python run_app.py
+```
+
+`.env` is git-ignored. The sidebar shows **LLM on** with the model names when it works. Any
+OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, Ollama, vLLM) also works:
+`LLM_PROVIDER=openai`, `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` and `LLM_MODEL`.
+
+### Other entry points
+
+```bash
+python -m pytest -q tests                                   # unit tests
+python evals/run_evals.py --paraphrases                     # known-answer evals (rule planner)
+python evals/run_evals.py --planner llm --paraphrases       # the same, against the live model
+python cli.py "why did success rate drop last week?" --sql  # terminal client, prints executed SQL
 python cli.py "why did success rate drop last week?" --then "now break that down by bank"
 ```
 
-`run_app.py` wraps `streamlit run app.py`. On Windows it avoids the harmless
-`ConnectionResetError [WinError 10054]` tracebacks when a browser tab closes, and Ctrl+C always
-returns within a few seconds instead of hanging on "Stopping...". If `streamlit` is "not recognized"
-on Windows, use `python -m streamlit run app.py` (or `python run_app.py`) instead.
+---
 
-Optional LLM planner (the system runs fully without one). Easiest: copy `.env.example` to `.env`,
-put your key in it and restart; the app, CLI and LLM evals read it automatically (`.env` is git-ignored;
-variables already set in the terminal take precedence). Check it with `python -m analyst.llm_check`: one real call per
-configured model, with a plain reason if it fails (no key, key rejected, model retired, rate limit). Or set the variables yourself:
+## Using the app
 
-```bash
-export LLM_PROVIDER=gemini GEMINI_API_KEY=...            # default model: gemini-3.5-flash-lite
-export LLM_PROVIDER=openai OPENAI_API_KEY=... [OPENAI_BASE_URL=... for Groq/OpenRouter/Ollama]
-export LLM_MODEL=...                                     # optional override
-export LLM_MIN_INTERVAL_S=4.5                            # optional pacing for free-tier keys (15 req/min)
-python evals/run_evals.py --planner llm --paraphrases    # evals against the live model
-```
+**Ask** (main page). Type a question and press *Analyse*. Answers read like a short analyst report:
 
-The Gemini key is sent in the `x-goog-api-key` header, never in the URL, so it can't leak into logs or tracebacks.
-Older defaults (`gemini-2.0-flash`, `gemini-2.5-flash`) now return 404 for new keys.
+- **Headline** with a confidence badge, and a status line: planner used, queries run, time, model cost.
+- **Summary**: Findings (each tagged with its query), Likely causes (hypotheses, never stated as
+  fact), Recommended actions, Caveats, and Method (dataset, metric definition, period, comparison
+  period, filters, assumptions, why this confidence).
+- **Charts**: daily trend with data-quality days marked, mix-vs-rate contribution bars, breakdowns.
+- **Evidence** (collapsed): every query that ran, the result tables and the full trace (steps,
+  model calls, the JSON plan).
 
-### Sign-in
+What it understands:
 
-The role comes from the signed-in account, never from a control the user can change.
+| You can ask | Example |
+|---|---|
+| Why something changed | "Why did success rate drop last week?", "What drove the rise in failure rate last week?" |
+| Breakdowns and comparisons | "Success rate by bank last week", "Compare UPI vs Card success rate in October" |
+| Trends | "Show daily success rate trend", "Success rate trend by method", "Success rate by week" |
+| Specific periods | "Success rate on 14 Oct", "…from 1 Oct to 10 Oct", "…first week of October", "…yesterday", "…in the last 14 days" |
+| Counts and money | "How many transactions failed yesterday?", "GMV by category last week" |
+| Technical vs business | "Technical success rate by bank", "Business decline rate by method in October" |
+| Source reconciliation | "Do settlements agree with transactions on success rate last week?" |
+| Conditions (LLM writes guarded SQL) | "Share of transactions above 5000 INR last week", "Success rate on weekends last week" |
+| Follow-ups | "Now break that down by bank", "What about UPI?" (**New conversation** clears context) |
+| Several things at once | "Show the daily success rate trend and why did it drop last week" (one tab per part) |
 
-| Demo account | Password | Role |
-|---|---|---|
-| `head.payments` | `demo-head` | Head of Payments (all merchants, no PII) |
-| `risk.ops` | `demo-risk` | Risk Ops (PII visible) |
-| `kam.a` | `demo-kam` | KAM Portfolio A (own merchants only) |
+Typos in known words are corrected and shown ("Read 'sucess' as 'success'"). When a question is
+ambiguous, names something the data can't apply, or has no period for a "why" question, the app
+asks instead of guessing.
 
-These are **demo accounts** in `config/users.demo.json` (salted PBKDF2-SHA256 hashes). For anything
-real, point `USERS_FILE` at your own file (`python -m analyst.auth add <user> <role>` prompts for a
-password), or run behind an SSO proxy with `AUTH_MODE=header`: the proxy authenticates the user and
-sets `X-Forwarded-Email` (configurable via `AUTH_HEADER`); the role is still looked up from the users
-file. Header mode is only safe when the app is reachable exclusively through that proxy.
+**SQL console**: hand-written, read-only SQL through the same safety guard and access scope as
+model-written SQL, with examples of unsafe queries it blocks. **Audit log**: your own queries
+(who, role, when, outcome).
 
-Every query is appended to `logs/audit.jsonl` (user, role, time, SQL, outcome; path via `AUDIT_LOG`).
-Users see only their own entries in the Session log tab.
-
-Deep link for demos: `http://localhost:8501/?q=Why did success rate drop last week?`
+---
 
 ## Roles and what each can run
 
 Defined once in `analyst/rbac.py`, **enforced by the engine and the SQL guard** (not only hidden in
-the UI), and shown to each user in the sidebar under *Your access*.
+the UI), and shown to each user under *Your access* in the sidebar.
 
 | Capability | Head of Payments | Risk Ops | KAM (Portfolio A) |
 |---|---|---|---|
 | Ask questions | all merchants | all merchants | Portfolio A merchants only |
 | Raw ingested data (`transactions_raw`, with duplicates) | yes | yes | no |
 | Customer PII (`customer_vpa`) | no | yes | no |
-| SQL console (hand-written, read-only, guarded) | yes | yes | no (not in navigation; engine refuses) |
-| Executed SQL (physical tables, row-level scope rewrite) | no | yes | no (engine strips it from answers) |
+| SQL console (hand-written, read-only, guarded) | yes | yes | no (engine refuses) |
+| Executed SQL (physical tables, row-level scope rewrite) | no | yes | no (engine strips it) |
 
-Answers show Summary and Charts first; the proof (queries, result tables, trace) is in a collapsed
-*Evidence* section. The audit log always keeps the executed SQL, whatever the role sees. Suggested
-questions only include ones the signed-in role is allowed to run.
+Out-of-scope requests are denied with the rule that applied (`pii`, `row_scope`, `table_scope`,
+`sql_console`); merchant scope is also applied as a row-level rewrite on every query, as a second
+layer. Suggested questions only include ones the signed-in role can run. The audit log always keeps
+the executed SQL.
 
-## Interface
+---
 
-A product-style UI built only on Streamlit's native theming (no extra UI dependencies):
-
-- **Navigation:** sidebar pages *Ask*, *SQL console* and *Audit log*; assistant settings
-  (planner, LLM status, outage simulation), data health and the signed-in user below them.
-- **Answers read like a short analyst report:** headline with a confidence badge and a status
-  line (planner, queries, time, model cost), then Findings (each with the query it came from),
-  Likely causes, Recommended actions, Caveats and Method; Charts, Queries, Data and Trace tabs.
-- **Design system:** `.streamlit/config.toml` (Inter, one indigo accent, neutral greys, light and
-  dark palettes, compact type scale) and `ui/theme.py` (one stylesheet for the app's own elements;
-  no selectors on Streamlit internals). Components in `ui/components.py`, screens in `ui/pages.py`,
-  the answer view in `ui/answer.py`; `app.py` only wires them together.
-- Why no shadcn/antd component libraries: `streamlit-antd-components` has had no release since
-  January 2024; `streamlit-shadcn-ui` renders each component in its own iframe, which does not follow
-  the app's light/dark theme or font. Streamlit's built-in Material icons replace Lucide.
-
-## Architecture
+## How it works
 
 ```
 question
-  │
+  │  spelling correction · split multi-part questions · attach follow-up context
   ▼
-Planner ── LLM (JSON plan, validated against catalog, 1 retry with error feedback)
-  │        └─ on outage / repeated malformed output → deterministic rule planner
+Planner ─ LLM (JSON plan against the semantic catalog; backup model, retry-after, circuit breaker)
+  │       └─ on outage / invalid output / rejected key → deterministic rule planner
   ▼
-Plan validation (known metrics/dimensions/filters, time window inside data, ambiguity → clarify)
+Plan checks ─ known metrics/dimensions · period inside the data · ambiguity → ask ·
+  │           every condition in the question applied (else guarded custom SQL or ask) ·
+  │           LLM dates inside the period asked · unknown words never silently ignored
   ▼
-Compiler (plan → SQL over *logical* tables using the semantic layer)
+Compiler ─ plan → SQL over logical tables (one definition per metric in semantic.py)
   ▼
-SQL Guard (sqlglot AST): read-only · single statement · allow-listed functions only ·
-           catalog tables only · RBAC (tables, PII columns, merchant scope) ·
-           no cartesian joins / bounded fact scans · row-level scope rewrite · auto LIMIT
+SQL guard (sqlglot AST) ─ single read-only SELECT · allow-listed functions only · catalog tables only ·
+  │                       role checks (tables, PII, merchants) · join/scan limits · scope rewrite · LIMIT
   ▼
-Executor (read-only DuckDB, one cursor per query, 8s timeout, result cache, persistent audit log)
+Executor ─ read-only DuckDB, one cursor per query, 8 s timeout, result cache, JSONL audit log
   ▼
-Analysis: headline + CI → mix/rate decomposition across 7 segmentations →
-          significance-filtered rate drivers → failure-reason drill-down
+Analysis ─ headline + 95% CI · technical vs business split · mix-vs-rate decomposition over
+  │        7 segmentations · significance-filtered drivers · failure-reason drill-down
   ▼
-Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats ·
-        assumptions · confidence · citation (dataset, metric definition, window, filters)
+Answer ─ findings [query ids] · likely causes · actions · caveats · method · confidence + reasons
 ```
-
-| Module | Role |
-|---|---|
-| `data/generate_data.py` | Synthetic data with planted scenarios (documented in the file header) |
-| `analyst/semantic.py` | Metric & dimension catalog; one definition of "success rate" |
-| `analyst/rbac.py` | Roles: Head of Payments, Risk Ops (PII), KAM Portfolio A (row-scoped) |
-| `analyst/guard.py` | SQL safety + access control + scope rewrite |
-| `analyst/llm.py` | Provider abstraction, retries, token/latency/cost tracking |
-| `analyst/rule_planner.py` | Deterministic planner and fallback |
-| `analyst/drivers.py` | Exact mix/rate decomposition + z-scores |
-| `analyst/dq.py` | Duplicates, gaps, missing dimension, source reconciliation, pending share |
-| `analyst/engine.py` | Orchestration and answer composition |
 
 ### Key design decisions
 
-- **The LLM plans; code computes.** The model only produces a JSON plan referencing the
-  catalog (or, as a last resort, a single SELECT). Numbers come from executed SQL and the
-  narrative is templated from those results, so the model cannot invent a figure.
-- **Mix vs rate decomposition.** `ΔR = Σ Δwᵢ(r̄ᵢ − Rᴬ) + Σ Δrᵢ w̄ᵢ`, exact (unit-tested).
-  The primary view is the segmentation where mix explains the most. Rate drivers are only
-  taken from that view, because at a coarser level a mix shift *inside* a segment looks
-  like that segment's rate dropping (e.g. "UPI got worse"). The eval suite checks this.
-- **Technical vs business first.** Failures are classified once in the semantic layer: technical
-  (TIMEOUT, BANK_DOWNTIME) vs business declines (insufficient funds, customer drop-off, risk and
-  issuer policy). Every success-rate diagnosis splits the change exactly into technical, business
-  and pending parts, and reports the technical success rate (business declines left out of the
-  denominator). The hypothesis and first recommendation follow from which side moved.
-  `technical_success_rate`, `technical_failure_rate`, `business_decline_rate` and the
-  `decline_type` dimension are also available directly.
-- **Fail closed.** The SQL guard allows only listed functions (aggregate, date, math, string), so
-  a dangerous DuckDB function nobody thought of is rejected; the old blocked-name list let e.g.
-  `current_setting()` through. Without the LLM, a word the planner has no rule for ("premium
-  customers") gets a clarifying question, not an answer to a different question. With the LLM,
-  each such word must appear in the plan or its assumptions, or the answer is marked low
-  confidence with a caveat. Model-written SQL must visibly apply every detected condition
-  (threshold value, day of week, time of day), and the answer lists the exact filters applied.
-- **Safe for concurrent users.** One engine serves every session. All per-request state (follow-up
-  context, outage simulation) travels with the request, each query runs on its own DuckDB cursor
-  (a timeout cancels only that query), and query IDs are numbered per answer. A threaded test
-  checks that follow-up context never crosses between users.
-- **Clarify rather than guess** when the comparison period or the denominator is missing.
-  Lower-risk defaults (e.g. "last 7 days" for a snapshot) are applied and listed as assumptions.
-  The metric-ambiguity check is enforced in code on LLM plans too. If the model quietly picks a
-  measure for "how are we performing?", the engine overrides it with a clarification and logs an
-  `ambiguity_guard` step.
-- **Never silently drop a condition.** If the question contains something the catalog can't
-  express (an amount threshold, a distinct count, a percentile), a catalog plan would answer a
-  different question with full confidence. A coverage guard detects this (regex detector + the
-  model's own `unsupported` list) and re-plans as model-written SQL, which goes through the same
-  guard, or asks the user. It never answers while ignoring the condition.
-  Word conditions count too: weekends, time of day, "high-value"/"big transactions", and new or
-  returning customers. When the model picks a cut-off for a vague term, the definition goes into
-  the headline and a caveat.
-- **Period check on LLM plans.** The dates a model's plan (or SQL) uses must lie inside the period
-  the question names. A plan that answers "weekends last week" with 18-19 Oct is sent back once
-  with the error; if it is still wrong, the deterministic planner takes over.
-- **Follow-ups.** "Now break that down by bank" / "what about UPI?" keep the previous question's
-  metric, period, filters and analysis type (both planners). Standalone questions ignore it.
-- **Premise check.** "Why did GMV drop?" when GMV rose is answered with
-  "Premise check: ... it actually rose" before the numbers.
-- **Provider resilience.** When the primary model is overloaded or rate-limited, the planner tries
-  backup models in order (`LLM_FALLBACK_MODELS`, default `gemini-3.1-flash-lite` for Gemini). A
-  short wait the provider asks for (Retry-After / `retryDelay`, at most `LLM_MAX_RETRY_WAIT_S`=5s) is
-  honoured once per model; longer ones are not waited for. After 3 consecutive failures a model is
-  skipped for 60s (circuit breaker, shared across users), and each request has a 20s budget
-  (`LLM_REQUEST_BUDGET_S`). At most two calls per model, then the deterministic planner takes over.
-  The trace shows which model answered.
-- **LLM robustness**: tolerant JSON parsing (trailing commas), one retry with the validation
-  errors fed back, no retry on 429/5xx (falls back immediately), and an in-process plan cache so
-  re-asking a question costs no quota.
-- **Access control in two layers**: an explicit deny with a reason (PII column, merchant
-  literal outside portfolio), and a row-level rewrite as defence in depth.
+- **The LLM plans; code computes.** The model outputs a JSON plan that references the catalog (or,
+  only when the catalog can't express a condition, one SELECT). Numbers come from executed SQL and
+  the text is built from those results, so the model cannot invent a figure.
+- **Mix vs rate decomposition.** `ΔR = Σ Δwᵢ(r̄ᵢ − Rᴬ) + Σ Δrᵢ·w̄ᵢ`, exact and unit-tested. The primary
+  view is the segmentation where mix explains most; rate drivers come only from that view, because
+  at a coarser level a mix shift *inside* a segment looks like that segment getting worse.
+- **Technical vs business first.** Failures are classified once (technical: TIMEOUT, BANK_DOWNTIME;
+  business: insufficient funds, customer drop-off, risk and issuer policy). Every success-rate
+  diagnosis splits the change exactly into technical, business and pending parts; the hypothesis
+  and first action follow from which side moved.
+- **Fail closed, and say so.** The guard allows only listed functions. A word the planner has no rule
+  for gets a question, not an answer to a different question; an LLM plan must account for it or
+  the answer is marked low confidence. LLM SQL must visibly apply each stated condition, its dates
+  must sit inside the period asked, and the classic `created_at <= 'last day'` mistake (which drops
+  that whole day) is corrected before execution and disclosed.
+- **Clarify rather than guess** when the period or the measure is missing; lower-risk defaults
+  (e.g. "last 7 days" for a snapshot) are listed as assumptions.
+- **Honest uncertainty.** Confidence interval on the change, z-scores for drivers, data-quality caveats
+  only when they overlap the period, a premise check ("you asked why it dropped; it rose").
+- **Safe for concurrent users.** One engine serves all sessions; per-request state travels with the
+  request; each query has its own cursor; a threaded test checks that contexts never mix.
+- **Resilient to the model provider.** Backup models, short provider-requested waits, a circuit
+  breaker and a time budget; after that the deterministic planner answers and the trace says why.
 
-## Evaluation results
+---
 
-Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
+## Data
+
+`data/generate_data.py` builds a seeded DuckDB database: 8 full weeks, **31 Aug – 25 Oct 2026**
+("today" is the last day). 285,654 transaction rows as ingested (285,243 unique), 40 merchants,
+6 banks, 4 payment methods, 2,240 settlement rows. All names are fictional.
+
+| Table | Contents |
+|---|---|
+| `transactions` | one row per payment attempt (de-duplicated view): time, merchant, bank, method, amount, status (SUCCESS / FAILED / PENDING), failure reason, customer VPA (PII) |
+| `transactions_raw` | the same, exactly as ingested (includes duplicates) |
+| `merchants` | name, category, city tier, onboarding date, KAM portfolio |
+| `banks`, `payment_methods` | dimensions |
+| `settlements` | finance system's daily roll-up per merchant (resolves PENDING later) |
+
+Planted scenarios (the ground truth the evals check):
+
+| # | Scenario | Detail |
+|---|---|---|
+| 1 | Mix shift | From 19 Oct a QuickTix sale adds ~1,500 attempts/day, mostly UPI via Delta Co-op Bank (~70% success rate) |
+| 2 | Genuine degradation | From 21 Oct, Coastal Bank NetBanking drops ~11 pts (BANK_DOWNTIME) |
+| 3 | Duplicates | 20–22 Oct: an ingestion retry re-inserts 411 FAILED rows |
+| 4 | Missing data | 14 Oct: only rows before 12:00 landed |
+| 5 | Missing dimension | 8–10 Oct: some UPI rows have no bank_id |
+| 6 | Source disagreement | settlements resolve most PENDING to SUCCESS, so they report ~1 pt more success |
+| 7 | PII | customer VPA readable by Risk Ops only |
+
+---
+
+## Failure and exception scenarios
+
+| Scenario | What happens | Try |
+|---|---|---|
+| Missing or duplicated records | Data-health panel flags them; analysis uses the de-duplicated view; caveats appear when the period overlaps; confidence drops | "Why did success rate drop last week?", "Success rate on 14 Oct", "…raw including duplicates" |
+| Request outside access scope | Denied with the rule name; merchant scope also enforced as a row-level rewrite | Head of Payments: "Show customer VPAs with the most failures last week"; KAM: "Success rate for QuickTix last week" |
+| Two sources disagree | Transactions vs settlements reconciled; the gap is explained (PENDING resolved later) with guidance on which to use | "Do settlements agree with transactions on success rate last week?" |
+| Decline explained by mix shift | Exact mix-vs-rate split, like-for-like rate, contribution chart | "Why did success rate drop last week?" |
+| Ambiguous period or denominator | Clarifying question with clickable options | "Why did success rate drop?", "How are we performing last week?" |
+| Expensive or unsafe query | Blocked with the rule name; 8 s timeout | SQL console examples: DELETE, file read, cartesian join, raw-schema bypass |
+| Model provider down / key rejected | Backup model, then the deterministic planner, flagged in caveats and trace | Sidebar: *Simulate LLM outage* |
+
+### Requirements coverage
+
+| Requirement | Where |
+|---|---|
+| ≥ 2 related datasets | 6 tables above |
+| Natural-language questions, SQL generated and executed | Ask page; LLM or rule planner; compiler + guard + executor |
+| Query and analysis steps shown | Evidence → Queries, Trace |
+| Charts and tables | Charts tab; Evidence → Data |
+| Dataset, filters and period cited | Method block; query id on every finding |
+| Facts vs hypotheses vs recommendations | Findings / Likely causes / Recommended actions |
+| Role-based access and query restrictions | Roles table above |
+| Data-quality checks and warnings | Data health panel; caveats; confidence |
+| Cohort comparison / drill-down | Segment decomposition, technical vs business, failure reasons, follow-ups |
+| Cost/timeout controls and caching | Guard limits, 8 s timeout, result and plan caches |
+| Known-answer evaluation | [Evaluation](#evaluation) |
+| Confidence and uncertainty | Confidence badge + reasons, CI, z-scores |
+
+---
+
+## Evaluation
+
+`evals/run_evals.py` asks the engine known questions and compares the answers with **independent,
+hand-written SQL on the raw tables** (not the engine's own compiler). It covers headline numbers,
+the planted drivers, data-quality caveats, clarifications, access denials, guard blocks, LLM-written
+SQL for conditions, follow-ups, multi-part questions and the provider-outage fallback. A held-out set
+of reworded questions (never used as prompt examples) checks that planning generalises.
+
+The table below is generated from saved runs; it is never typed by hand.
 
 <!-- eval-results:start -->
 <!-- generated by evals/render_results.py from evals/results/*.json; do not edit -->
@@ -214,46 +281,103 @@ Ground truth comes from hand-written SQL on the raw tables, not from the engine'
 - LLM (live): models tried in order `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`; answers came from `gemini-3.5-flash-lite` ×27, `gemini-3.1-flash-lite` ×6.
 <!-- eval-results:end -->
 
-The core suite includes questions the catalog can't express: amount thresholds, "on weekends",
-and "high-value". With the LLM, the model writes SQL that matches the hand-written ground truth
-exactly. Without it, the engine asks instead of answering a different question. Two follow-up
-cases ("now break that down by bank", "what about UPI?") check that context carries over. The
-eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
-The eval runner does not retry: provider resilience is the app's job (below), so the numbers show
-what a user would get. Exit codes: `0` all passed, `1` at least one wrong answer, `3` only provider
-errors remain. The table above is generated: `python evals/run_evals.py [--planner llm] --paraphrases
---save` writes `evals/results/<planner>.json` (every case, the commit, which model answered), and
-`python evals/render_results.py` rebuilds the table (`--check` fails if the README is stale).
+```bash
+python evals/run_evals.py [--planner llm] --paraphrases --save   # writes evals/results/<planner>.json
+python evals/render_results.py                                    # rebuilds the table above (--check for CI)
+```
 
-The paraphrases were written after the prompt was finalised and are not used as prompt examples.
-They show whether the planner generalises beyond the questions it was tuned against.
-Runs vary slightly even at temperature 0: in earlier runs the model occasionally chose a
-different plan (e.g. the "raw" question as a trend), and the provider sometimes returns 429/503. In `auto` mode those cases fall back
-to the rule planner, and the fallback is shown in the trace.
+Exit codes: `0` all passed, `1` at least one wrong answer, `3` only model-provider errors remain.
+The eval runner never retries: provider resilience is the app's job, so the numbers show what a user
+gets. Unit tests (`tests/test_core.py`) cover the decomposition maths, LLM retry/validation, the
+circuit breaker, guard allow-list, auth, role enforcement, concurrency and every bug found in testing.
 
-## Failure scenarios covered
+---
 
-| Scenario | What happens | Demo |
+## Project structure
+
+```
+payments-analyst/
+├── app.py                  Streamlit entry: settings, engine, sign-in, navigation
+├── run_app.py              Launcher: clean Ctrl+C, no Windows connection-reset noise
+├── cli.py                  Terminal client (--sql, --then for follow-ups, --role, --planner)
+├── analyst/                The engine (no UI code)
+│   ├── engine.py           Orchestration: plan checks, analysis, answer composition
+│   ├── semantic.py         Metric and dimension catalog; failure taxonomy
+│   ├── rule_planner.py     Deterministic planner: dates, metrics, spelling, follow-ups, multi-part
+│   ├── llm.py              LLM planner: providers, backup models, circuit breaker, plan validation
+│   ├── plan.py             Plan and Window types, validation
+│   ├── compiler.py         Plan → SQL
+│   ├── guard.py            SQL safety and access control (sqlglot AST)
+│   ├── sqlfix.py           Disclosed fix for LLM SQL that drops the last day
+│   ├── executor.py         Read-only DuckDB, timeout, cache, audit log
+│   ├── drivers.py          Mix-vs-rate decomposition, confidence interval, z-scores
+│   ├── dq.py               Data-quality checks
+│   ├── rbac.py             Roles and capabilities
+│   ├── auth.py             Sign-in (password file or SSO header); `check` command
+│   ├── config.py           .env loader
+│   ├── llm_check.py        `python -m analyst.llm_check`
+│   └── charts.py           Plotly figures
+├── ui/                     Presentation only
+│   ├── pages.py            Sign-in, Ask, SQL console, Audit log, sidebar
+│   ├── answer.py           Report-style answer view
+│   ├── components.py       Small rendering helpers
+│   └── theme.py            Stylesheet for the app's own elements
+├── .streamlit/config.toml  Design system: Inter, one accent, light and dark palettes
+├── data/generate_data.py   Synthetic data with planted scenarios
+├── evals/                  Known-answer evals, saved results, README table generator
+├── tests/test_core.py      Unit tests
+└── config/users.demo.json  Demo accounts
+```
+
+---
+
+## Configuration
+
+Set in `.env` (see `.env.example`) or the environment; values already set in the terminal win.
+
+| Variable | Default | Purpose |
 |---|---|---|
-| Missing / duplicated records | DQ checks flag 411 duplicates (20–22 Oct) and 14 Oct outage; analysis uses de-duplicated view; caveats attached when window overlaps | main question; "…raw including duplicates" |
-| Request outside access scope | PII → denied for non-Risk roles; KAM asking about QuickTix → denied; KAM aggregates auto-scoped | "Show customer VPAs…", switch role to KAM |
-| Two sources disagree | Transactions vs settlements reconciled; gap = 65% of PENDING resolving later; guidance on which to use | "Do settlements agree…" |
-| Decline explained by mix shift | Decomposition + like-for-like rate | main question |
-| Ambiguous period / denominator | Clarifying question with clickable options | "Why did success rate drop?", "How are we performing?" |
-| Expensive / unsafe query | Guard blocks DELETE, stacked statements, file reads, raw-schema bypass, cartesian joins, SELECT * with PII; 8s timeout | SQL playground presets |
-| Model provider unavailable / malformed output | One retry with validation errors; then fallback to rule planner, flagged in caveats & trace | sidebar "Simulate model-provider outage" |
+| `LLM_PROVIDER` | `none` | `gemini` or `openai` (any OpenAI-compatible API) |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` | | API key (Gemini key is sent in a header, never the URL) |
+| `OPENAI_BASE_URL` | OpenAI | Groq, OpenRouter, Ollama, vLLM … |
+| `LLM_MODEL` | `gemini-3.5-flash-lite` | Primary model |
+| `LLM_FALLBACK_MODELS` | `gemini-3.1-flash-lite` | Backup models, comma-separated |
+| `LLM_MIN_INTERVAL_S` | `0` | Pace requests on a free-tier key (15 requests/minute → `4.5`) |
+| `LLM_MAX_RETRY_WAIT_S` / `LLM_REQUEST_BUDGET_S` | `5` / `20` | Longest provider-requested wait honoured; time budget per question |
+| `LLM_BREAKER_THRESHOLD` / `LLM_BREAKER_COOLDOWN_S` | `3` / `60` | Skip a model after N failures in a row, for N seconds |
+| `AUTH_MODE` | `password` | `header`: trust an SSO proxy's identity header (only behind that proxy) |
+| `AUTH_HEADER` | `X-Forwarded-Email` | Identity header in `header` mode |
+| `USERS_FILE` | `config/users.demo.json` | Accounts and roles; add users with `python -m analyst.auth add <user> <role>` |
+| `AUDIT_LOG` | `logs/audit.jsonl` | Audit log path (empty to disable) |
 
-## Assumptions, mocks and limitations
+---
 
-- Data is **synthetic** and seeded; bank and merchant names are fictional. "Today" = last date in the data (25 Oct 2026).
-- Success rate = SUCCESS / all attempts (PENDING in denominator). The excl.-pending variant is available.
-- Driver attribution is descriptive, not causal. Causes are always shown as hypotheses.
-- The rule planner covers common question shapes (diagnose, breakdown, trend, source comparison).
-  Anything else needs the LLM, or gets a clarification.
-- Authentication is a local users file (demo accounts above) or a trusted SSO header; there is no
-  built-in OIDC flow. Cost controls are heuristic (AST rules + timeout), not optimizer-based.
-- The failure taxonomy (technical vs business) is a fixed mapping of this dataset's failure reasons;
-  real issuer/NPCI response codes would need a maintained mapping owned by the payments team.
-- The vocabulary check is deliberately strict: an unusual but harmless word makes the rule planner
-  ask. Extend `_KNOWN_WORDS` in `rule_planner.py` as new phrasings come up.
-- LLM cost uses list prices in `llm.py`; adjust to your contract.
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `'streamlit' is not recognized` (Windows) | Use `python run_app.py` or `python -m streamlit run app.py` |
+| Sidebar says **LLM off** / answers show "Model cost: none" | Create `.env` from `.env.example`, add the key, restart |
+| "API key rejected" caveat | `python -m analyst.llm_check` gives the reason; check the key was copied completely |
+| Sign-in fails for every account | `python -m analyst.auth check`; if the browser autofilled the fields, type them instead |
+| Ctrl+C hangs on "Stopping…" | Start with `python run_app.py`, which always stops within 5 s |
+| Answers look stale after `git pull` | Stop and restart the app |
+
+---
+
+## Assumptions and limitations
+
+- **Synthetic data with planted scenarios.** The independent ground-truth SQL and held-out reworded
+  questions reduce, but don't remove, the bias of grading against scenarios we designed.
+- **"Today" is the last day in the data** (25 Oct 2026); "last week" is 19–25 Oct vs 12–18 Oct.
+- **Success rate** = SUCCESS / all attempts (PENDING in the denominator); the excluding-pending and
+  technical variants are available and named on every answer.
+- **Driver attribution is descriptive, not causal**; causes are always shown as hypotheses.
+- **Authentication** is a local users file or a trusted SSO header; there is no built-in OIDC flow.
+- **Cost controls** are AST rules, limits and a timeout, not a cost estimate before execution; caches
+  are in memory.
+- **The rule planner's vocabulary is deliberately strict**: unusual phrasing gets a clarifying question
+  (the LLM planner handles it). Extend `_KNOWN_WORDS` in `rule_planner.py` as needed.
+- **The failure taxonomy** is a fixed mapping of this dataset's reasons; real issuer/NPCI response
+  codes would need a maintained mapping.
+- **LLM cost** uses approximate list prices in `llm.py`.
