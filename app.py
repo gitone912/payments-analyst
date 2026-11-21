@@ -21,13 +21,17 @@ st.set_page_config(page_title="Payments AI Analyst", page_icon="📊", layout="w
 st.markdown("""
 <style>
 .block-container {padding-top: 1.6rem; max-width: 1250px;}
-.fact {border-left: 3px solid #2a78d6; padding: 6px 12px; margin: 6px 0; background: #f6f8fc; border-radius: 4px;}
-.hypo {border-left: 3px solid #eb6834; padding: 6px 12px; margin: 6px 0; background: #fdf6f2; border-radius: 4px;}
-.rec  {border-left: 3px solid #1baf7a; padding: 6px 12px; margin: 6px 0; background: #f2faf6; border-radius: 4px;}
-.ev {font-family: ui-monospace, monospace; font-size: 0.78rem; color: #52514e; background: #ecebe7;
-     padding: 1px 6px; border-radius: 8px; margin-left: 6px;}
+/* Theme-neutral: tinted backgrounds + inherited text colour, readable in light AND dark mode */
+.fact {border-left: 3px solid #2a78d6; padding: 6px 12px; margin: 6px 0; background: rgba(42,120,214,0.10);
+       color: inherit; border-radius: 4px;}
+.hypo {border-left: 3px solid #eb6834; padding: 6px 12px; margin: 6px 0; background: rgba(235,104,52,0.10);
+       color: inherit; border-radius: 4px;}
+.rec  {border-left: 3px solid #1baf7a; padding: 6px 12px; margin: 6px 0; background: rgba(27,175,122,0.10);
+       color: inherit; border-radius: 4px;}
+.ev {font-family: ui-monospace, monospace; font-size: 0.78rem; color: inherit; opacity: 0.85;
+     background: rgba(128,128,128,0.22); padding: 1px 6px; border-radius: 8px; margin-left: 6px;}
 .headline {font-size: 1.25rem; font-weight: 600; margin: 0.4rem 0 0.8rem 0;}
-.small {color: #52514e; font-size: 0.85rem;}
+.small {opacity: 0.75; font-size: 0.85rem;}
 </style>""", unsafe_allow_html=True)
 
 

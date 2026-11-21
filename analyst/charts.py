@@ -5,12 +5,14 @@ import pandas as pd
 import plotly.graph_objects as go
 
 S1, S2, S3 = "#2a78d6", "#eb6834", "#1baf7a"   # categorical slots 1-3 (fixed order)
-INK, INK2, GRID = "#0b0b0b", "#52514e", "#e6e5e1"
+# Neutrals chosen to read on both light and dark backgrounds; text colour comes from the app theme
+INK2, GRID = "#8c8b86", "rgba(128,128,128,0.25)"
 CRITICAL = "#d03b3b"
 
 LAYOUT = dict(
-    template="plotly_white", height=380, margin=dict(l=10, r=10, t=50, b=10),
-    font=dict(family="Inter, system-ui, sans-serif", color=INK, size=13),
+    height=380, margin=dict(l=10, r=10, t=50, b=10),
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="Inter, system-ui, sans-serif", size=13),
     hovermode="x unified", legend=dict(orientation="h", y=1.08, x=0, title=None),
     xaxis=dict(gridcolor=GRID, linecolor=GRID), yaxis=dict(gridcolor=GRID, linecolor=GRID, zeroline=False),
 )
@@ -28,7 +30,7 @@ def trend(spec: dict, dq_days: list | None = None) -> go.Figure:
     is_pct = y in ("success_rate", "success_rate_excl_pending", "failure_rate")
     fig = go.Figure(go.Scatter(x=df.day, y=df[y], mode="lines+markers", name=spec["title"],
                                line=dict(color=S1, width=2), marker=dict(size=8, color=S1,
-                               line=dict(color="white", width=2)),
+                               line=dict(width=0)),
                                customdata=df["attempts"],
                                hovertemplate="%{y:.2%}<br>%{customdata:,} attempts<extra></extra>"
                                if is_pct else "%{y:,.0f}<extra></extra>"))
@@ -57,10 +59,10 @@ def contrib(spec: dict, top: int = 10) -> go.Figure:
     lab = df.segment.astype(str)
     fig = go.Figure()
     fig.add_bar(y=lab, x=df.mix_effect * 100, orientation="h", name="Mix effect (traffic shifted)",
-                marker=dict(color=S1, line=dict(color="white", width=2), cornerradius=4),
+                marker=dict(color=S1, line=dict(width=0), cornerradius=4),
                 hovertemplate="%{y}<br>mix %{x:+.2f} pts<extra></extra>")
     fig.add_bar(y=lab, x=df.rate_effect * 100, orientation="h", name="Rate effect (segment got worse/better)",
-                marker=dict(color=S2, line=dict(color="white", width=2), cornerradius=4),
+                marker=dict(color=S2, line=dict(width=0), cornerradius=4),
                 hovertemplate="%{y}<br>rate %{x:+.2f} pts<extra></extra>")
     fig.update_layout(**{**LAYOUT, "hovermode": "closest", "height": 60 + 34 * len(df)},
                       barmode="relative", title=spec["title"] + " (percentage points)")
@@ -82,7 +84,7 @@ def bar(spec: dict) -> go.Figure:
         fig.update_layout(barmode="group")
     else:
         fig.add_bar(y=df[x].astype(str), x=df[y], orientation="h",
-                    marker=dict(color=S1, cornerradius=4, line=dict(color="white", width=2)),
+                    marker=dict(color=S1, cornerradius=4, line=dict(width=0)),
                     text=[f"{v:.1%}" if is_pct else f"{v:,.0f}" for v in df[y]], textposition="outside",
                     customdata=df["attempts"],
                     hovertemplate="%{y}: %{x:.2%}<br>%{customdata:,} attempts<extra></extra>" if is_pct
