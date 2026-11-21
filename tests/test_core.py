@@ -472,3 +472,16 @@ def test_spelling_leaves_real_words_alone():
     eng = _engine()
     assert correct_spelling("how did sucess if defined here?", eng.known_names)[1] == [("sucess", "success")]
     assert correct_spelling("most failurs last week", eng.known_names)[1] == [("failurs", "failures")]
+
+
+def test_every_chart_kind_renders():
+    from analyst import charts
+    eng = _engine()
+    kinds = set()
+    for q in ("Why did success rate drop last week?", "Success rate by bank last week", "Show daily success rate trend",
+              "Do settlements agree with transactions on success rate last week?",
+              "Success rate by bank and method last week"):
+        for spec in eng.ask(q, "head_of_payments", "rules").charts:
+            charts.render(spec, [])
+            kinds.add(spec["kind"])
+    assert kinds == {"trend", "contrib", "bar", "sources"}
