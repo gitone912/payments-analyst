@@ -32,7 +32,8 @@ on Windows, use `python -m streamlit run app.py` (or `python run_app.py`) instea
 
 Optional LLM planner (the system runs fully without one). Easiest: copy `.env.example` to `.env`,
 put your key in it and restart; the app, CLI and LLM evals read it automatically (`.env` is git-ignored;
-variables already set in the terminal take precedence). Or set the variables yourself:
+variables already set in the terminal take precedence). Check it with `python -m analyst.llm_check`: one real call per
+configured model, with a plain reason if it fails (no key, key rejected, model retired, rate limit). Or set the variables yourself:
 
 ```bash
 export LLM_PROVIDER=gemini GEMINI_API_KEY=...            # default model: gemini-3.5-flash-lite
