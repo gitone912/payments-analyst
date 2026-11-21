@@ -5,12 +5,13 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import os
+import sys
 
 import pandas as pd
 import streamlit as st
 
 from analyst import charts
-from analyst.auth import auth_mode, config_problem, user_from_headers, verify_password
+from analyst.auth import auth_mode, config_problem, failure_reason, user_from_headers, verify_password
 from analyst.engine import AnalystEngine
 from analyst.rbac import ROLES
 
@@ -72,12 +73,19 @@ if user is None:
         st.error(f"**Sign-in is not configured:** {problem}  \nRun `python -m analyst.auth check` for details.")
     with st.form("login"):
         st.subheader("Sign in")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
+        # autocomplete hints tell the browser this is a sign-in form (not "create a new password")
+        username = st.text_input("Username", autocomplete="username")
+        password = st.text_input("Password", type="password", autocomplete="current-password")
         if st.form_submit_button("Sign in", type="primary"):
             u = verify_password(username, password)
-            if u is None:
+            if u is None and (not username.strip() or not password):
+                # a browser-autofilled value can be visible but never sent to the app
+                st.error("Username or password was empty when the form was sent. If your browser filled "
+                         "them in, click into each field and type the value, then sign in again.")
+                print(f"[auth] sign-in failed: {failure_reason(username, password)}", file=sys.stderr)
+            elif u is None:
                 st.error("Invalid username or password.")
+                print(f"[auth] sign-in failed: {failure_reason(username, password)}", file=sys.stderr)
             else:
                 st.session_state.clear()
                 st.session_state.user = u

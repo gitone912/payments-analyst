@@ -68,6 +68,18 @@ def config_problem(path: str | None = None) -> str | None:
     return None
 
 
+def failure_reason(username: str, password: str, path: str | None = None) -> str:
+    """Why a sign-in failed, for the server log only (never shown to the user, never the password)."""
+    name = (username or "").strip().lower()
+    if not name:
+        return "empty username"
+    if not password:
+        return f"empty password for '{name}' (the value did not reach the app: browser autofill?)"
+    if name not in load_users(path):
+        return f"unknown username '{name}'"
+    return f"wrong password for '{name}' (received {len(password)} characters)"
+
+
 def hash_password(password: str, salt: str | None = None, iterations: int = ITERATIONS) -> dict:
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), iterations).hex()
