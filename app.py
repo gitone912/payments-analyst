@@ -10,6 +10,10 @@ import sys
 import pandas as pd
 import streamlit as st
 
+from analyst.config import load_env
+
+load_env()  # .env in the project folder (LLM key etc.); must run before the engine is built
+
 from analyst import charts
 from analyst.auth import auth_mode, config_problem, failure_reason, user_from_headers, verify_password
 from analyst.engine import AnalystEngine
@@ -112,7 +116,8 @@ with st.sidebar:
     if eng.llm.enabled:
         st.success(f"LLM: {eng.llm.provider} / {eng.llm.model}")
     else:
-        st.info("LLM: not configured (set LLM_PROVIDER + key). Using deterministic planner.")
+        st.info("LLM: off. To turn it on, copy `.env.example` to `.env` in the project folder, put your "
+                "Gemini key in it and restart the app. Using the deterministic planner meanwhile.")
     # per-session demo switch; passed with each request, never set on the shared engine
     simulate_outage = st.toggle("Simulate model-provider outage", value=False)
 

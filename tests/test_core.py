@@ -436,3 +436,15 @@ def test_multi_part_questions_are_split_and_answered_separately():
     assert c.plan["intent"] == "diagnose_change" and d.plan["metric"] == "failure_rate"
     assert d.plan["window"] == c.plan["window"]                       # part 2 builds on part 1
     assert any("'sucess' as 'success'" in x for x in c.assumptions)  # correction still shown
+
+
+def test_env_file_loads_but_never_overrides(tmp_path, monkeypatch):
+    from analyst.config import load_env
+    f = tmp_path / ".env"
+    f.write_bytes("﻿# comment\nLLM_PROVIDER=gemini\nGEMINI_API_KEY=\"abc\"  # key\nexport LLM_MODEL=x\n\nBAD LINE\n".encode("utf-8"))
+    for k in ("LLM_PROVIDER", "GEMINI_API_KEY", "LLM_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("LLM_MODEL", "already-set")
+    loaded = load_env(str(f))
+    assert sorted(loaded) == ["GEMINI_API_KEY", "LLM_PROVIDER"]
+    assert os.environ["GEMINI_API_KEY"] == "abc" and os.environ["LLM_MODEL"] == "already-set"

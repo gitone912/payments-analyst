@@ -2,6 +2,7 @@
 import argparse
 import os
 
+from analyst.config import load_env
 from analyst.engine import AnalystEngine
 
 DB = os.path.join(os.path.dirname(__file__), "data", "payments.duckdb")
@@ -38,6 +39,7 @@ if __name__ == "__main__":
     ap.add_argument("--then", action="append", default=[], metavar="FOLLOW_UP",
                     help='follow-up question(s), e.g. --then "now break that down by bank"')
     a = ap.parse_args()
+    load_env()
     eng = AnalystEngine(DB)
     previous = None
     for question in [" ".join(a.question), *a.then]:

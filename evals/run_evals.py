@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import duckdb  # noqa: E402
 
+from analyst.config import load_env  # noqa: E402
 from analyst.engine import AnalystEngine  # noqa: E402
 
 DB = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
@@ -59,6 +60,8 @@ def pcts(text):
 
 
 def main(planner: str, paraphrases: bool = False, save: bool = False):
+    if planner != "rules":
+        load_env()  # the deterministic suite never needs a key; don't let a local .env change it
     if planner in ("llm", "auto"):
         # free-tier keys allow ~15 requests/min; pace calls so the run measures the model, not the quota
         os.environ.setdefault("LLM_MIN_INTERVAL_S", "4.5")
