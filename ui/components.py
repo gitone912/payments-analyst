@@ -84,3 +84,13 @@ def health_row(label: str, status: str, note: str) -> str:
 
 def empty_state(title: str, text: str) -> None:
     st.html(f'<div class="pa-empty"><h3>{esc(title)}</h3><p>{esc(text)}</p></div>')
+
+
+def access_rows(capabilities: list[tuple[str, bool, str]]) -> None:
+    """What the signed-in role can and cannot do (mirrors what the engine enforces)."""
+    rows = []
+    for name, allowed, detail in capabilities:
+        mark = ('<span class="pa-access yes">Allowed</span>' if allowed
+                else '<span class="pa-access no">Not allowed</span>')
+        rows.append(f'<div class="pa-health" title="{esc(detail)}"><span>{esc(name)}</span>{mark}</div>')
+    st.html("".join(rows))

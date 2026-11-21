@@ -77,13 +77,12 @@ def render(a, dq_days: list, key: str = "a") -> None:
     c.statline([("Planner", _planner_label(a)), ("Queries", str(len(a.queries))),
                 ("Time", f"{a.total_ms:,.0f} ms"), ("Model cost", cost_txt)])
 
-    t_sum, t_chart, t_sql, t_data, t_trace = st.tabs(
-        [":material/article: Summary", ":material/monitoring: Charts", ":material/code: Queries",
-         ":material/table: Data", ":material/account_tree: Trace"])
+    t_sum, t_chart = st.tabs([":material/article: Summary", ":material/monitoring: Charts"])
 
     with t_sum:
         c.section("Findings", len(a.facts))
-        st.caption("Computed from the data. The reference after each finding is the query it came from.")
+        st.caption("Computed from the data. The reference after each finding (Q1, Q2, ...) is the query it "
+                   "came from: open Evidence below to see it.")
         c.item_list([f["text"] for f in a.facts], "facts", [f["evidence"] for f in a.facts])
         if a.hypotheses:
             c.section("Likely causes", len(a.hypotheses))
@@ -117,29 +116,36 @@ def render(a, dq_days: list, key: str = "a") -> None:
                 st.caption("Mix effect: traffic moved toward or away from the segment. "
                            "Rate effect: the segment's own rate changed.")
 
-    with t_sql:
-        st.caption("Every query passed the SQL safety guard before it ran. Expand a query to see it.")
-        for q in a.queries:
-            label = f"{q.query_id} · {q.purpose} · {q.rows:,} rows · {q.ms:,.0f} ms" + (" · cached" if q.cached else "")
-            with st.expander(label):
-                st.code(q.sql, language="sql")
-                st.caption("Guard checks passed: " + " · ".join(q.checks))
-                with st.popover("Executed SQL (after access-scope rewrite)", icon=":material/shield:"):
-                    st.code(q.executable_sql, language="sql")
-
-    with t_data:
-        if not a.tables:
-            c.empty_state("No tables", "This answer did not produce tabular results.")
-        for i, (name, df) in enumerate(a.tables.items()):
-            st.markdown(f"**{name}**")
-            _table(df, key=f"{key}_table_{i}")
-
-    with t_trace:
-        st.markdown("**Workflow steps**")
-        st.dataframe(pd.DataFrame([vars(s) for s in a.steps]), width="stretch", hide_index=True)
-        if a.llm_calls:
-            st.markdown("**Model calls**")
-            st.dataframe(pd.DataFrame([vars(x) for x in a.llm_calls]), width="stretch", hide_index=True)
-        if a.plan:
-            st.markdown("**Analysis plan**")
-            st.json(a.plan, expanded=False)
+    # Evidence: the proof behind the answer, one click away but not in the reader's way
+    n_tables = len(a.tables)
+    label = (f"Evidence · {len(a.queries)} {'query' if len(a.queries) == 1 else 'queries'} · "
+             f"{n_tables} {'table' if n_tables == 1 else 'tables'} · trace")
+    with st.expander(label, icon=":material/fact_check:", expanded=False):
+        e_sql, e_data, e_trace = st.tabs([":material/code: Queries", ":material/table: Data",
+                                          ":material/account_tree: Trace"])
+        with e_sql:
+            st.caption("Every query passed the SQL safety guard before it ran.")
+            for q in a.queries:
+                label = (f"{q.query_id} · {q.purpose} · {q.rows:,} rows · {q.ms:,.0f} ms"
+                         + (" · cached" if q.cached else ""))
+                with st.expander(label):
+                    st.code(q.sql, language="sql")
+                    st.caption("Guard checks passed: " + " · ".join(q.checks))
+                    if q.executable_sql:  # only roles allowed to see internals receive it from the engine
+                        with st.popover("Executed SQL (after access-scope rewrite)", icon=":material/shield:"):
+                            st.code(q.executable_sql, language="sql")
+        with e_data:
+            if not a.tables:
+                c.empty_state("No tables", "This answer did not produce tabular results.")
+            for i, (name, df) in enumerate(a.tables.items()):
+                st.markdown(f"**{name}**")
+                _table(df, key=f"{key}_table_{i}")
+        with e_trace:
+            st.markdown("**Workflow steps**")
+            st.dataframe(pd.DataFrame([vars(s) for s in a.steps]), width="stretch", hide_index=True)
+            if a.llm_calls:
+                st.markdown("**Model calls**")
+                st.dataframe(pd.DataFrame([vars(x) for x in a.llm_calls]), width="stretch", hide_index=True)
+            if a.plan:
+                st.markdown("**Analysis plan**")
+                st.json(a.plan, expanded=False)

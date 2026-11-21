@@ -11,7 +11,7 @@ import json
 import numbers
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 
 import pandas as pd
@@ -131,6 +131,10 @@ class AnalystEngine:
         df, rec = self.ex.run(g.executable_sql, original_sql=g.original_sql, purpose=purpose,
                               role=role.key, checks=g.checks, query_id=f"Q{len(ans.queries) + 1}",
                               user=ans.user)
+        if not role.can_view_executed_sql:
+            # the executed SQL names physical tables and shows the row-level scope rewrite: keep it in
+            # the audit log (already written) but out of what this role receives
+            rec = replace(rec, executable_sql="")
         ans.queries.append(rec)
         return df, rec
 
@@ -444,6 +448,9 @@ class AnalystEngine:
         ans = Answer(question=sql, role=role.label, planner_used="(hand-written SQL)", user=user)
         t0 = time.perf_counter()
         try:
+            if not role.can_run_sql:
+                raise AccessDenied(f"Role '{role.label}' cannot run hand-written SQL. Ask a question instead: "
+                                   "answers are scoped to your merchants automatically.", "sql_console")
             self._free_sql(Plan(intent="free_sql", sql=sql), role, ans)
             ans.caveats = ["Hand-written SQL: passed the safety guard; interpretation is yours."]
         except AccessDenied as e:

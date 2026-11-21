@@ -67,6 +67,23 @@ Users see only their own entries in the Session log tab.
 
 Deep link for demos: `http://localhost:8501/?q=Why did success rate drop last week?`
 
+## Roles and what each can run
+
+Defined once in `analyst/rbac.py`, **enforced by the engine and the SQL guard** (not only hidden in
+the UI), and shown to each user in the sidebar under *Your access*.
+
+| Capability | Head of Payments | Risk Ops | KAM (Portfolio A) |
+|---|---|---|---|
+| Ask questions | all merchants | all merchants | Portfolio A merchants only |
+| Raw ingested data (`transactions_raw`, with duplicates) | yes | yes | no |
+| Customer PII (`customer_vpa`) | no | yes | no |
+| SQL console (hand-written, read-only, guarded) | yes | yes | no (not in navigation; engine refuses) |
+| Executed SQL (physical tables, row-level scope rewrite) | no | yes | no (engine strips it from answers) |
+
+Answers show Summary and Charts first; the proof (queries, result tables, trace) is in a collapsed
+*Evidence* section. The audit log always keeps the executed SQL, whatever the role sees. Suggested
+questions only include ones the signed-in role is allowed to run.
+
 ## Interface
 
 A product-style UI built only on Streamlit's native theming (no extra UI dependencies):

@@ -17,6 +17,7 @@ load_env()  # .env in the project folder (LLM key etc.); must run before the eng
 
 from analyst.auth import auth_mode, user_from_headers  # noqa: E402
 from analyst.engine import AnalystEngine  # noqa: E402
+from analyst.rbac import ROLES  # noqa: E402
 from ui import pages, theme  # noqa: E402
 
 DB = os.path.join(os.path.dirname(__file__), "data", "payments.duckdb")
@@ -56,9 +57,12 @@ if user is None:
 
 st.logo("assets/logo.svg", icon_image="assets/logo_icon.svg")
 ctx = pages.sidebar(pages.Context(eng=eng, user=user))
+role = ROLES[user.role]
 nav = st.navigation([
     st.Page(lambda: pages.ask_page(ctx), title="Ask", icon=":material/chat:", url_path="ask", default=True),
-    st.Page(lambda: pages.sql_page(ctx), title="SQL console", icon=":material/terminal:", url_path="sql"),
+    # the SQL console is only offered to roles allowed to run hand-written SQL (the engine enforces it too)
+    *([st.Page(lambda: pages.sql_page(ctx), title="SQL console", icon=":material/terminal:", url_path="sql")]
+      if role.can_run_sql else []),
     st.Page(lambda: pages.audit_page(ctx), title="Audit log", icon=":material/history:", url_path="audit"),
 ], position="sidebar")
 nav.run()

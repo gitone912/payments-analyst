@@ -485,3 +485,43 @@ def test_every_chart_kind_renders():
             charts.render(spec, [])
             kinds.add(spec["kind"])
     assert kinds == {"trend", "contrib", "bar", "sources"}
+
+
+def test_role_capabilities_are_enforced_by_the_engine():
+    from analyst.rbac import ROLES
+    eng = _engine()
+    # SQL console: Head of Payments and Risk Ops yes, KAM no (refused by the engine, not only hidden)
+    assert eng.run_sql("SELECT COUNT(*) AS n FROM transactions", "head_of_payments").status == "answered"
+    assert eng.run_sql("SELECT COUNT(*) AS n FROM transactions", "risk_ops").status == "answered"
+    kam = eng.run_sql("SELECT COUNT(*) AS n FROM transactions", "kam_portfolio_a")
+    assert kam.status == "denied" and kam.denial_rule == "sql_console"
+    # executed SQL (physical tables + scope rewrite): only Risk Ops receives it
+    q = "Success rate by bank last week"
+    for role, visible in (("risk_ops", True), ("head_of_payments", False), ("kam_portfolio_a", False)):
+        a = eng.ask(q, role, "rules")
+        assert a.status == "answered" and all(bool(r.executable_sql) == visible for r in a.queries), role
+    # the table shown to users matches the enforced rules
+    caps = {r: {name: ok for name, ok, _ in ROLES[r].capabilities()} for r in ROLES}
+    assert caps["kam_portfolio_a"] == {"Ask questions": True, "Raw ingested data": False, "Customer PII": False,
+                                       "SQL console": False, "Executed SQL": False}
+    assert caps["risk_ops"]["Customer PII"] and caps["risk_ops"]["Executed SQL"]
+    assert caps["head_of_payments"]["SQL console"] and not caps["head_of_payments"]["Customer PII"]
+
+
+def test_audit_log_keeps_executed_sql_even_when_hidden_from_the_role(tmp_path):
+    from analyst.engine import AnalystEngine
+    db = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
+    eng = AnalystEngine(db, audit_path=str(tmp_path / "audit.jsonl"))
+    eng.ask("Success rate by merchant last week", "kam_portfolio_a", "rules", user="kam.a")
+    rows = eng.ex.read_audit(user="kam.a")
+    assert rows and all("merchant_id IN" in r["executable_sql"] for r in rows if r["status"] == "ok")
+
+
+def test_suggestions_only_offer_what_the_role_can_run():
+    from analyst.rbac import ROLES
+    from ui.pages import suggestions_for
+    eng = _engine()
+    for role_key, role in ROLES.items():
+        for q in suggestions_for(role):
+            a = eng.ask(q, role_key, "rules")
+            assert a.status != "denied", (role_key, q, a.message)

@@ -14,6 +14,18 @@ from analyst.rbac import ROLES
 from . import answer
 from . import components as c
 
+def suggestions_for(role) -> list[str]:
+    """Only suggest questions this role is allowed to get answered."""
+    out = list(SUGGESTIONS)
+    if role.merchant_scope_sql is not None:  # portfolio-scoped: use a merchant they own
+        out = [q.replace("QuickTix", "DailyBasket") for q in out]
+    if not role.can_see_pii:
+        out = [q for q in out if "VPA" not in q]
+    if "transactions_raw" not in role.allowed_tables:
+        out = [q for q in out if "raw" not in q]
+    return out
+
+
 SUGGESTIONS = [
     "Why did success rate drop last week?",
     "Success rate by bank last week",
@@ -101,6 +113,12 @@ def login_page() -> None:
 def sidebar(ctx: Context) -> Context:
     eng, user = ctx.eng, ctx.user
     with st.sidebar:
+        # who you are and what you may do, first: the role decides what every answer can contain
+        c.user_block(user.display_name, ROLES[user.role].label, user.username)
+        st.caption(ROLES[user.role].description)
+        c.eyebrow("Your access")
+        c.access_rows(ROLES[user.role].capabilities())
+        st.divider()
         c.eyebrow("Assistant")
         mode = st.segmented_control("Planner", ["Auto", "Rules", "LLM"], default="Auto", key="planner_choice",
                                     help="Auto uses the LLM when it is configured and falls back to the "
@@ -129,8 +147,6 @@ def sidebar(ctx: Context) -> Context:
         st.caption(f"Data {eng.data_start:%d %b} – {eng.data_end:%d %b %Y}")
 
         st.divider()
-        c.user_block(user.display_name, ROLES[user.role].label, user.username)
-        st.caption(ROLES[user.role].description)
         if auth_mode() != "header" and st.button("Sign out", icon=":material/logout:", type="tertiary"):
             st.session_state.clear()
             st.rerun()
@@ -188,7 +204,8 @@ def ask_page(ctx: Context) -> None:
         c.empty_state("Start with a question",
                       "Ask about success rate, failures, GMV or volume by bank, method, merchant or period. "
                       "Or pick one of these:")
-        pick = st.pills("Suggestions", SUGGESTIONS, key="suggestion", label_visibility="collapsed")
+        pick = st.pills("Suggestions", suggestions_for(ROLES[ctx.role_key]), key="suggestion",
+                        label_visibility="collapsed")
         if pick:
             st.session_state.pending_q = pick
             st.session_state.suggestion = None
@@ -211,9 +228,18 @@ def ask_page(ctx: Context) -> None:
 
 # ------------------------------------------------------------------ SQL console
 def sql_page(ctx: Context) -> None:
+    role = ROLES[ctx.role_key]
     c.page_header("SQL console",
-                  "Hand-written SQL goes through the same safety guard and access scope as model-written SQL.",
-                  "Tables: transactions, transactions_raw, merchants, banks, payment_methods, settlements")
+                  "Hand-written, read-only SQL. It goes through the same safety guard and access scope as "
+                  "model-written SQL.",
+                  "Tables: " + ", ".join(sorted(role.allowed_tables)))
+    if not role.can_run_sql:  # not in this role's navigation; also refused by the engine
+        c.callout("bad", f"{role.label} cannot run hand-written SQL. Ask a question instead: answers are "
+                         "scoped to your merchants automatically.", "Not available for your role")
+        return
+    st.caption(f"Runs as **{role.label}**: "
+               + ("all merchants" if role.merchant_scope_sql is None else "your merchants only")
+               + ("; customer PII allowed" if role.can_see_pii else "; customer PII columns refused") + ".")
     pick = st.selectbox("Example", list(SQL_PRESETS), key="sql_preset",
                         help="Try the unsafe examples to see the guard block them.")
     sql = st.text_area("SQL", SQL_PRESETS[pick], height=170, key=f"sql_text_{pick}")

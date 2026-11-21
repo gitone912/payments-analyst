@@ -55,6 +55,10 @@ _CSS = """
              padding: 0.28rem 0; }
 .pa-health span:last-child { opacity: 0.55; font-size: 0.75rem; }
 
+.pa-access { font-size: 0.72rem; font-weight: 600; }
+.pa-access.yes { color: #10B981; }
+.pa-access.no { color: #94A3B8; }
+
 /* ---------- answer: headline + status line ---------- */
 .pa-headline { font-size: 1.12rem; font-weight: 600; line-height: 1.45; margin: 0.25rem 0 0.6rem 0;
                letter-spacing: -0.005em; }
