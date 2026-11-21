@@ -195,28 +195,47 @@ def split_question(question: str) -> list[str]:
     return raw
 
 
+def _typo_distance(a: str, b: str) -> int:
+    """Edit distance counting a swap of two neighbouring letters as one edit ('bnak' -> 'bank')."""
+    d = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(len(a) + 1):
+        d[i][0] = i
+    for j in range(len(b) + 1):
+        d[0][j] = j
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[len(a)][len(b)]
+
+
 def correct_spelling(question: str, extra_known: set[str] = frozenset()) -> tuple[str, list[tuple[str, str]]]:
     """Fix obvious typos ("sucess", "faliure", "bnak", "Octobr") before planning. Only words the
     planner does not recognise are touched, and only when one known word is a close match, so a
     genuinely unknown word ("premium") is left alone and still gets a clarifying question.
     Returns the corrected question and the (wrong, right) pairs, which the answer lists."""
-    import difflib
-    vocab = sorted((_KNOWN_WORDS | set(extra_known)) - {w for w in _KNOWN_WORDS if len(w) < 4})
+    vocab = (_KNOWN_WORDS | set(extra_known)) - {w for w in _KNOWN_WORDS if len(w) < 4}
     fixes: list[tuple[str, str]] = []
     out = question
     for w in unrecognised_terms(question, extra_known):
         if len(w) < 4 or not w.isalpha():
             continue
-        # short words need a lower bar: one swapped letter ("bnak") already costs 25%
-        match = difflib.get_close_matches(w, vocab, n=2, cutoff=0.75 if len(w) <= 5 else 0.8)
-        if not match:
-            continue
-        if len(match) == 2 and difflib.SequenceMatcher(None, w, match[0]).ratio() == \
-                difflib.SequenceMatcher(None, w, match[1]).ratio():
-            continue  # two equally good candidates: ambiguous, ask instead of guessing
+        # a typo is one slip (wrong, extra, missing or swapped letter); long words may have two.
+        # A real word two edits away ("defined" vs "declined") is a different word, not a typo.
+        limit = 2 if len(w) >= 9 else 1
+        dists = sorted((_typo_distance(w, v), v) for v in vocab if abs(len(v) - len(w)) <= limit)
+        best = [v for d, v in dists if d == dists[0][0]] if dists and dists[0][0] <= limit else []
+        if len(best) > 1:  # tie: prefer the candidate with the same ending ('failurs' -> 'failures')
+            same_end = [v for v in best if v[-1] == w[-1]]
+            best = same_end if len(same_end) == 1 else best
+        if len(best) != 1:
+            continue  # nothing close, or two equally close candidates: ask instead of guessing
+        right = best[0]
         out = re.sub(rf"(?i)\b{re.escape(w)}\b",
-                     lambda m: match[0].capitalize() if m.group(0)[:1].isupper() else match[0], out)
-        fixes.append((w, match[0]))
+                     lambda m, r=right: r.capitalize() if m.group(0)[:1].isupper() else r, out)
+        fixes.append((w, right))
     return out, fixes
 
 

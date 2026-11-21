@@ -40,6 +40,14 @@ class ProviderUnavailable(Exception):
         self.retry_after = retry_after  # seconds the provider asked us to wait, if it said
 
 
+def _provider_message(body: bytes) -> str:
+    """The provider's human-readable error message, not raw response bytes."""
+    try:
+        return str(json.loads(body).get("error", {}).get("message", ""))[:200] or "no details"
+    except (ValueError, AttributeError):
+        return body[:200].decode("utf-8", "replace").strip() or "no details"
+
+
 class CircuitBreaker:
     """Per-model breaker: after `threshold` consecutive provider failures the model is skipped for
     `cooldown_s`, so users don't each wait for a model that is down. Thread-safe (shared engine)."""
@@ -272,7 +280,12 @@ class LLMPlanner:
                 raise ProviderUnavailable(f"HTTP {e.code} from provider", _retry_after(e.headers, body))
             if e.code == 404:  # retired / unknown model: treat as unavailable so the next model is tried
                 raise ProviderUnavailable(f"HTTP 404 (model not available) from provider")
-            raise RuntimeError(f"HTTP {e.code}: {body[:200]!r}")
+            message = _provider_message(body)
+            if e.code in (401, 403) or (e.code == 400 and "api key" in message.lower()):
+                # a bad key is a configuration problem: fall back like an outage, and say so plainly
+                raise ProviderUnavailable(f"API key rejected by the provider (HTTP {e.code}): check "
+                                          f"GEMINI_API_KEY in .env, or run python -m analyst.llm_check")
+            raise RuntimeError(f"provider error HTTP {e.code}: {message}")
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise ProviderUnavailable(f"network error: {e}")
 

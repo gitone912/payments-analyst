@@ -30,6 +30,7 @@ from .rule_planner import (RulePlanner, is_followup, metric_ambiguity, premise_d
                            unmodelled_conditions, unrecognised_terms, correct_spelling,
                            split_question)
 from .semantic import DIMENSIONS, METRICS
+from .sqlfix import fix_inclusive_end_dates
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
 
@@ -47,6 +48,10 @@ def fmt(metric: str, v: float) -> str:
 
 def pts(v: float) -> str:
     return f"{v * 100:+.2f} pts"
+
+
+class LLMUnavailable(Exception):
+    """The LLM planner was required (planner = llm) but could not produce a plan."""
 
 
 @dataclass
@@ -296,11 +301,15 @@ class AnalystEngine:
                 return res.plan
             reason = "; ".join(res.errors) or "no plan"
             if mode == "llm":
-                raise RuntimeError(f"LLM planner failed: {reason}")
+                raise LLMUnavailable(f"The language model could not be used ({reason}). Switch the planner to "
+                                     "'auto' to fall back to the deterministic planner.")
             ans.steps.append(Step("plan", "fallback", f"LLM planner failed ({reason}); "
                                   "fell back to deterministic planner"))
-            ans.caveats.append("The language model was unavailable or returned an invalid plan, so the "
-                               "deterministic planner was used. Supported question types still work.")
+            ans.caveats.append(
+                ("The language model key was rejected, so the deterministic planner was used. Fix "
+                 "GEMINI_API_KEY in .env (python -m analyst.llm_check shows why)." if "key rejected" in reason else
+                 "The language model was unavailable or returned an invalid plan, so the deterministic "
+                 "planner was used.") + " Supported question types still work.")
         plan = self.rules.plan(question, ans.prev_plan)
         ans.planner_used = ans.planner_used or "Deterministic rule planner"
         ans.steps.append(Step("plan", "ok", "Deterministic rule planner", (time.perf_counter() - t0) * 1000))
@@ -365,6 +374,13 @@ class AnalystEngine:
                 ans.plan = plan.to_dict()
                 self._attach_dq(ans, plan)
 
+            if plan.intent == "free_sql":
+                plan.sql, fixed = fix_inclusive_end_dates(plan.sql)
+                if fixed:  # model-written SQL that would silently drop the last day of the period
+                    note = ("Adjusted the model's SQL so the last day is included: " + "; ".join(fixed) + ".")
+                    ans.steps.append(Step("sql_fix", "ok", note))
+                    ans.assumptions.append(note)
+                    ans.plan = plan.to_dict()
             handler = {"diagnose_change": self._diagnose, "breakdown": self._breakdown,
                        "trend": self._trend, "compare_sources": self._sources,
                        "free_sql": self._free_sql}[plan.intent]
@@ -394,7 +410,7 @@ class AnalystEngine:
             ans.message = f"Query cancelled: {e}. Try a narrower time window or fewer dimensions."
         except Exception as e:  # noqa: BLE001
             ans.status = "error"
-            ans.message = f"{type(e).__name__}: {e}"
+            ans.message = str(e) if isinstance(e, LLMUnavailable) else f"{type(e).__name__}: {e}"
             ans.steps.append(Step("execute", "error", ans.message))
         finally:
             ans.total_ms = (time.perf_counter() - t0) * 1000

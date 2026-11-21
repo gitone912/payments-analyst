@@ -1,11 +1,11 @@
 {
   "planner": "rules",
-  "run_at": "2026-11-20T18:35:29+00:00",
-  "commit": "5800da5",
+  "run_at": "2026-11-21T14:33:07+00:00",
+  "commit": "aa1f9e2-dirty",
   "llm": null,
   "core": {
-    "passed": 40,
-    "total": 40,
+    "passed": 41,
+    "total": 41,
     "provider_errors": 0,
     "wrong": 0,
     "cases": [
@@ -163,6 +163,11 @@
         "id": "followup_slice",
         "result": "PASS",
         "description": "re-runs the diagnosis on UPI only (86.28% -> 82.72%)"
+      },
+      {
+        "id": "multi_part",
+        "result": "PASS",
+        "description": "two-part question answered separately (Delta 71.32%; ecommerce GMV Oct \u20b958,857,309)"
       },
       {
         "id": "guard_delete",

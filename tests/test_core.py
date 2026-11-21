@@ -448,3 +448,27 @@ def test_env_file_loads_but_never_overrides(tmp_path, monkeypatch):
     loaded = load_env(str(f))
     assert sorted(loaded) == ["GEMINI_API_KEY", "LLM_PROVIDER"]
     assert os.environ["GEMINI_API_KEY"] == "abc" and os.environ["LLM_MODEL"] == "already-set"
+
+
+def test_llm_sql_inclusive_end_date_is_fixed_and_disclosed():
+    from analyst.llm import LLMResult
+    from analyst.plan import Plan
+    eng = _engine()
+    eng.llm.provider = "gemini"
+    drops_sunday = Plan(intent="free_sql", sql=(
+        "SELECT SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS success_rate_weekends "
+        "FROM transactions WHERE created_at >= '2026-10-19' AND created_at <= '2026-10-25' "
+        "AND (EXTRACT(DOW FROM created_at) = 0 OR EXTRACT(DOW FROM created_at) = 6)"))
+    eng.llm.plan = lambda q, **kw: LLMResult(plan=drops_sunday)
+    a = eng.ask("What was the success rate on weekends last week?", "head_of_payments", "llm")
+    truth = eng.ex.raw("""SELECT AVG((status='SUCCESS')::INT) AS r FROM raw.transactions_clean
+        WHERE created_at >= '2026-10-24' AND created_at < '2026-10-26'""").r[0]
+    assert a.status == "answered" and f"{truth:.2%}" in a.headline          # 84.97%, not Saturday-only
+    assert any("last day is included" in x for x in a.assumptions)
+
+
+def test_spelling_leaves_real_words_alone():
+    from analyst.rule_planner import correct_spelling
+    eng = _engine()
+    assert correct_spelling("how did sucess if defined here?", eng.known_names)[1] == [("sucess", "success")]
+    assert correct_spelling("most failurs last week", eng.known_names)[1] == [("failurs", "failures")]

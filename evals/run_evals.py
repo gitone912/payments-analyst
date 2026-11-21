@@ -377,14 +377,15 @@ def save_results(planner, eng, passed, total, provider_errs, para) -> None:
         "commit": commit,
         "llm": {"provider": eng.llm.provider, "models": eng.llm.models,
                 "answered_by": MODELS_USED} if planner != "rules" else None,
-        "core": {"passed": passed, "total": total, "provider_errors": provider_errs,
-                 "wrong": total - passed - provider_errs, "cases": RECORDS},
+        "core": {"passed": int(passed), "total": int(total), "provider_errors": int(provider_errs),
+                 "wrong": int(total - passed - provider_errs), "cases": RECORDS},
         "paraphrases": para,
     }
     path = os.path.join(os.path.dirname(__file__), "results", f"{planner}.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+        # numpy/pandas scalars (e.g. a count summed from numpy booleans) -> plain Python values
+        json.dump(out, f, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     print(f"saved {os.path.relpath(path)}")
 
 
