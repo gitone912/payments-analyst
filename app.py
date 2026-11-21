@@ -14,15 +14,23 @@ import streamlit as st
 from analyst.config import load_env
 
 
+SECRET_NAMES: list[str] = []  # names only (never values), shown when the LLM is off on a deployment
+
+
 def _secrets_to_env() -> None:
     """On Streamlit Community Cloud the LLM key is set in the app's Secrets screen, not a .env file.
-    Copy top-level secrets into the environment (values already set there win)."""
+    Copy secrets into the environment: top level or inside a [section], any letter case
+    ('gemini_api_key' -> GEMINI_API_KEY). Values already set in the environment win."""
     try:
-        for key, value in st.secrets.items():
-            if isinstance(value, (str, int, float, bool)) and key not in os.environ:
-                os.environ[key] = str(value)
+        items = list(st.secrets.items())
     except Exception:  # noqa: BLE001  no secrets file: local run, .env is used instead
-        pass
+        return
+    for key, value in items:
+        pairs = value.items() if hasattr(value, "items") else [(key, value)]
+        for k, v in pairs:
+            if isinstance(v, (str, int, float, bool)):
+                SECRET_NAMES.append(str(k))
+                os.environ.setdefault(str(k).upper(), str(v).strip())
 
 
 _secrets_to_env()

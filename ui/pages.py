@@ -128,8 +128,12 @@ def sidebar(ctx: Context) -> Context:
             st.caption(f":material/check_circle: LLM on · `{eng.llm.model}`"
                        + (f" · backup `{eng.llm.models[1]}`" if len(eng.llm.models) > 1 else ""))
         else:
-            st.caption(":material/do_not_disturb_on: LLM off: copy `.env.example` to `.env`, add your key "
-                       "and restart. The deterministic planner answers meanwhile.")
+            names = getattr(sys.modules.get("__main__"), "SECRET_NAMES", None) or []
+            hint = (f" Secrets found: {', '.join(f'`{n}`' for n in names)}; none is a usable LLM key "
+                    "(need `GEMINI_API_KEY` or `OPENAI_API_KEY`)." if names else "")
+            st.caption(":material/do_not_disturb_on: LLM off: set `GEMINI_API_KEY` in `.env` (local) or the "
+                       "app's Secrets (Streamlit Cloud), then restart. The deterministic planner answers "
+                       "meanwhile." + hint)
         # per-session demo switch; passed with each request, never set on the shared engine
         ctx.simulate_outage = st.toggle("Simulate LLM outage", value=False, key="simulate_outage",
                                         help="Demonstrates the fallback to the deterministic planner.")

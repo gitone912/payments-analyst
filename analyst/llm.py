@@ -233,7 +233,10 @@ def plan_from_json(text: str) -> Plan:
 class LLMPlanner:
     def __init__(self, data_start: date, data_end: date, banks: list[str], cats: list[str],
                  provider: str | None = None, model: str | None = None, max_attempts: int = 2):
-        self.provider = (provider or os.getenv("LLM_PROVIDER", "none")).lower()
+        detected = ("gemini" if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+                    else "openai" if os.getenv("OPENAI_API_KEY") else "none")
+        # a key alone is enough: LLM_PROVIDER is only needed to choose when several keys are set
+        self.provider = (provider or os.getenv("LLM_PROVIDER") or detected).strip().lower()
         default_model = {"gemini": "gemini-3.5-flash-lite", "openai": "gpt-4o-mini"}.get(self.provider, "")
         self.model = model or os.getenv("LLM_MODEL", default_model)
         # Backup models, tried in order when the primary is overloaded or rate-limited
