@@ -141,6 +141,9 @@ tab_ask, tab_sql, tab_log = st.tabs(["Ask a question", "SQL playground", "Sessio
 
 
 def render_answer(a):
+    spelling = next((x for x in a.steps if x.name == "spelling"), None)
+    if spelling:
+        st.caption(f"✏️ {spelling.detail} Answered: *{a.question}*")
     status_box = {"denied": st.error, "blocked": st.error, "error": st.warning, "clarify": st.info}
     if a.status in status_box:
         label = {"denied": "🔒 Access denied", "blocked": "🛡️ Blocked by safety guard",
@@ -243,9 +246,19 @@ with tab_ask:
     q = st.text_input("Question", key="q", placeholder="e.g. Why did success rate drop last week?")
     prev = st.session_state.get("prev")
     if prev and prev["role"] == role_key:
-        st.caption(f"Follow-ups such as \"now break that down by bank\" or \"what about UPI?\" build on: "
-                   f"*{prev['question']}*")
-    clicked = st.button("Analyse", type="primary") or bool(pending)
+        st.caption(f"Context: *{prev['question']}*. Only questions that refer back (\"now break that down by "
+                   f"bank\", \"what about UPI?\") use it; other questions start fresh.")
+
+    def new_conversation():
+        # runs before the next rerun, so the question box can be cleared safely
+        for k in ("prev", "last"):
+            st.session_state.pop(k, None)
+        st.session_state.q = ""
+
+    c_go, c_new, _ = st.columns([1, 2, 6])
+    clicked = c_go.button("Analyse", type="primary") or bool(pending)
+    c_new.button("New conversation", on_click=new_conversation, disabled="prev" not in st.session_state
+                 and "last" not in st.session_state, help="Forget the previous question and answer")
     if clicked and q.strip():
         with st.spinner("Planning, validating and querying..."):
             context = prev if prev and prev["role"] == role_key else None
@@ -253,7 +266,10 @@ with tab_ask:
                           simulate_outage=simulate_outage)
             st.session_state.last = ans
             if ans.status == "answered" and ans.plan:
-                st.session_state.prev = {"question": q, "plan": ans.plan, "role": role_key}
+                st.session_state.prev = {"question": ans.question, "plan": ans.plan, "role": role_key}
+        # the context line and "New conversation" button are drawn above this point: redraw once so
+        # they reflect the answer just stored (the answer itself is kept in session state)
+        st.rerun()
     if "last" in st.session_state:
         render_answer(st.session_state.last)
 

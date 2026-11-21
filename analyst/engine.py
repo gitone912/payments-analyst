@@ -27,7 +27,7 @@ from .llm import LLMCall, LLMPlanner, plan_from_json
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
 from .rule_planner import (RulePlanner, is_followup, metric_ambiguity, premise_direction,
-                           unmodelled_conditions, unrecognised_terms)
+                           unmodelled_conditions, unrecognised_terms, correct_spelling)
 from .semantic import DIMENSIONS, METRICS
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
@@ -325,6 +325,12 @@ class AnalystEngine:
         role = ROLES[role_key]
         ans = Answer(question=question, role=role.label, user=user, simulate_outage=simulate_outage)
         try:
+            corrected, fixes = correct_spelling(question, self.known_names)
+            if fixes:  # plan on the corrected text, and say exactly what was changed
+                note = "Read " + ", ".join(f"'{a}' as '{b}'" for a, b in fixes) + "."
+                ans.question = question = corrected
+                ans.steps.append(Step("spelling", "ok", note))
+                ans.assumptions.append(note)
             plan = self.make_plan(question, ans, planner_mode, previous)
             ans.plan = plan.to_dict()
             ans.assumptions.extend(plan.assumptions)

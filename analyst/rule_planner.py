@@ -177,6 +177,31 @@ def unrecognised_terms(question: str, extra_known: set[str] = frozenset()) -> li
     return out
 
 
+def correct_spelling(question: str, extra_known: set[str] = frozenset()) -> tuple[str, list[tuple[str, str]]]:
+    """Fix obvious typos ("sucess", "faliure", "bnak", "Octobr") before planning. Only words the
+    planner does not recognise are touched, and only when one known word is a close match, so a
+    genuinely unknown word ("premium") is left alone and still gets a clarifying question.
+    Returns the corrected question and the (wrong, right) pairs, which the answer lists."""
+    import difflib
+    vocab = sorted((_KNOWN_WORDS | set(extra_known)) - {w for w in _KNOWN_WORDS if len(w) < 4})
+    fixes: list[tuple[str, str]] = []
+    out = question
+    for w in unrecognised_terms(question, extra_known):
+        if len(w) < 4 or not w.isalpha():
+            continue
+        # short words need a lower bar: one swapped letter ("bnak") already costs 25%
+        match = difflib.get_close_matches(w, vocab, n=2, cutoff=0.75 if len(w) <= 5 else 0.8)
+        if not match:
+            continue
+        if len(match) == 2 and difflib.SequenceMatcher(None, w, match[0]).ratio() == \
+                difflib.SequenceMatcher(None, w, match[1]).ratio():
+            continue  # two equally good candidates: ambiguous, ask instead of guessing
+        out = re.sub(rf"(?i)\b{re.escape(w)}\b",
+                     lambda m: match[0].capitalize() if m.group(0)[:1].isupper() else match[0], out)
+        fixes.append((w, match[0]))
+    return out, fixes
+
+
 METRIC_CLARIFICATION = {
     "question": "Which measure do you mean? 'Success rate' can use two denominators.",
     "options": ["Success rate (successful / all attempts, incl. pending)",

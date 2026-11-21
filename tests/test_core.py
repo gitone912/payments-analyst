@@ -407,3 +407,16 @@ def test_auth_config_problem_is_reported_not_hidden(tmp_path):
     empty = tmp_path / "empty.json"
     empty.write_text('{"users": []}')
     assert "no accounts" in config_problem(str(empty))
+
+
+def test_spelling_is_corrected_and_disclosed():
+    from analyst.rule_planner import correct_spelling
+    eng = _engine()
+    fixed, fixes = correct_spelling("faliure rate by bnak last weak", eng.known_names)
+    assert fixed == "failure rate by bank last week" and len(fixes) == 3
+    a = eng.ask("Why did sucess rate drop last week?", "head_of_payments", "rules")
+    assert a.status == "answered" and "Success rate fell" in a.headline
+    assert any("'sucess' as 'success'" in x for x in a.assumptions)
+    # a genuinely unknown word is not "corrected" into something else: it still gets a question
+    assert correct_spelling("Success rate for premium customers", eng.known_names)[1] == []
+    assert eng.ask("Success rate for premium customers last week", "head_of_payments", "rules").status == "clarify"
