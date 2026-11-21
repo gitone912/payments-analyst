@@ -18,12 +18,17 @@ each kept separate.
 ```bash
 pip install -r requirements.txt
 python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
-streamlit run app.py                    # UI at http://localhost:8501 (sign in: see below)
+python run_app.py                       # UI at http://localhost:8501 (sign in: see below)
 python evals/run_evals.py               # 40 known-answer / safety checks
 python -m pytest -q tests               # 23 unit tests
 python cli.py "why did success rate drop last week?" --sql
 python cli.py "why did success rate drop last week?" --then "now break that down by bank"
 ```
+
+`run_app.py` wraps `streamlit run app.py`. On Windows it avoids the harmless
+`ConnectionResetError [WinError 10054]` tracebacks when a browser tab closes, and Ctrl+C always
+returns within a few seconds instead of hanging on "Stopping...". If `streamlit` is "not recognized"
+on Windows, use `python -m streamlit run app.py` (or `python run_app.py`) instead.
 
 Optional LLM planner (the system runs fully without one):
 
