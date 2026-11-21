@@ -56,7 +56,8 @@ def render(a, dq_days: list, key: str = "a") -> None:
             cols = st.columns(min(len(opts), 4))
             for i, opt in enumerate(opts):
                 if cols[i % len(cols)].button(opt, key=f"{key}_opt_{i}", width="stretch"):
-                    base = a.question if not a.message.startswith("I couldn't") else ""
+                    standalone = a.clarification.get("standalone") or a.message.startswith("I couldn't")
+                    base = "" if standalone else a.question
                     st.session_state.pending_q = (base + " " + opt).strip() if base else opt
                     st.rerun()
         if a.caveats:

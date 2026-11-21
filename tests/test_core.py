@@ -550,3 +550,14 @@ def test_sweep_regressions_dates_metrics_names():
     assert ask("success rate last month").plan["baseline"] is None      # no 1-day 'previous month'
     assert "lowest UPI" not in ask("success rate for upi").headline      # one segment is not ranked
     assert "GMV (INR)" in ask("daily gmv trend").headline
+
+
+def test_off_topic_questions_get_a_scope_message_not_a_metric_question():
+    eng = _engine()
+    for q in ("what improvement we are providing", "who are you", "hello", ""):
+        a = eng.ask(q, "risk_ops", "rules")
+        assert a.status == "clarify" and a.message.startswith("That's outside what I can answer"), q
+        assert a.clarification["standalone"] and len(a.clarification["options"]) == 3
+    # genuinely ambiguous data questions keep their specific clarification
+    assert "Which period" in eng.ask("Why did success rate drop?", "risk_ops", "rules").message
+    assert "Which measure" in eng.ask("How are we performing last week?", "risk_ops", "rules").message

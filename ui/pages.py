@@ -204,12 +204,14 @@ def ask_page(ctx: Context) -> None:
         c.empty_state("Start with a question",
                       "Ask about success rate, failures, GMV or volume by bank, method, merchant or period. "
                       "Or pick one of these:")
-        pick = st.pills("Suggestions", suggestions_for(ROLES[ctx.role_key]), key="suggestion",
-                        label_visibility="collapsed")
-        if pick:
-            st.session_state.pending_q = pick
+        def run_suggestion():
+            # a callback runs before the page is redrawn, so the pill can be reset here; resetting it
+            # in the page body (after the widget exists) raises StreamlitWidgetAlreadyInstantiatedError
+            st.session_state.pending_q = st.session_state.suggestion
             st.session_state.suggestion = None
-            st.rerun()
+
+        st.pills("Suggestions", suggestions_for(ROLES[ctx.role_key]), key="suggestion",
+                 label_visibility="collapsed", on_change=run_suggestion)
         return
 
     answers = st.session_state.last if isinstance(st.session_state.last, list) else [st.session_state.last]
