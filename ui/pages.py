@@ -172,25 +172,33 @@ def ask_page(ctx: Context) -> None:
     if pending:
         st.session_state.q = pending
 
-    with st.container(border=True, key="composer"):
+    prev = st.session_state.get("prev")
+
+    def new_conversation():
+        # runs before the next rerun, so the question box can be cleared safely
+        for k in ("prev", "last"):
+            st.session_state.pop(k, None)
+        st.session_state.q = ""
+
+    # A form: Enter in the box and the Analyse button both submit the question together with the text
+    # just typed, in one round trip (a plain text box only commits on Enter/blur, so Enter used to just
+    # save the text, and on a slow connection the first click could be spent committing it).
+    with st.form("composer", border=True, enter_to_submit=True):
         q = st.text_input("Question", key="q", placeholder="e.g. Why did success rate drop last week?",
                           label_visibility="collapsed")
-        prev = st.session_state.get("prev")
-
-        def new_conversation():
-            # runs before the next rerun, so the question box can be cleared safely
-            for k in ("prev", "last"):
-                st.session_state.pop(k, None)
-            st.session_state.q = ""
-
         b1, b2, note = st.columns([1.1, 1.9, 6], vertical_alignment="center")
-        clicked = b1.button("Analyse", type="primary", icon=":material/arrow_forward:", width="stretch") or bool(pending)
-        b2.button("New conversation", icon=":material/add_comment:", on_click=new_conversation, width="stretch",
-                  disabled="prev" not in st.session_state and "last" not in st.session_state,
-                  help="Forget the previous question and answer")
+        with b1:
+            submitted = st.form_submit_button("Analyse", type="primary", icon=":material/arrow_forward:",
+                                              width="stretch")
+        with b2:
+            st.form_submit_button("New conversation", icon=":material/add_comment:", on_click=new_conversation,
+                                  width="stretch",
+                                  disabled="prev" not in st.session_state and "last" not in st.session_state,
+                                  help="Forget the previous question and answer")
         if prev and prev["role"] == ctx.role_key:
             note.caption(f"Context: *{prev['question']}*. Follow-ups that refer back (\"break that down by "
                          f"bank\", \"what about UPI?\") use it; other questions start fresh.")
+    clicked = submitted or bool(pending)
 
     if clicked and q.strip():
         with st.spinner("Planning, validating and querying…"):
