@@ -275,10 +275,10 @@ The table below is generated from saved runs; it is never typed by hand.
 | Planner | Core checks passed | Wrong answers | Provider errors | Held-out paraphrases | Run (UTC) · commit |
 |---|---|---|---|---|---|
 | Deterministic rules | 41/41 | 0 | 0 | 9/10 | 2026-11-21 17:21 · `93d7c70` |
-| LLM (live) `gemini-3.5-flash-lite` | 41/41 | 0 | 0 | 10/10 | 2026-11-21 14:37 · `a92e159-dirty` |
+| LLM (live) `gemini-3.5-flash-lite` | 41/41 | 0 | 0 | 10/10 | 2026-11-21 17:29 · `fc7458f` |
 
 - Deterministic rules paraphrases not passed: "How did Card do compared with NetBanking in September?" (FAIL)
-- LLM (live): models tried in order `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`; answers came from `gemini-3.5-flash-lite` ×27, `gemini-3.1-flash-lite` ×6.
+- LLM (live): models tried in order `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`; answers came from `gemini-3.1-flash-lite` ×4, `gemini-3.5-flash-lite` ×29.
 <!-- eval-results:end -->
 
 ```bash
