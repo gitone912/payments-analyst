@@ -5,3 +5,4 @@ data/payments.duckdb
 data/payments.duckdb.wal
 .env
 logs/
+.streamlit/secrets.toml

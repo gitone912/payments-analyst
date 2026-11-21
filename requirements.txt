@@ -1,7 +1,8 @@
-duckdb>=1.1
-sqlglot>=25
-pandas>=2.2
-numpy>=1.26
-plotly>=5.22
-streamlit>=1.40
-pytest>=8
+# Runtime dependencies, pinned to the versions the app and evals were tested with.
+# (sqlglot is pinned exactly: the SQL guard's function allow-list uses its expression class names.)
+duckdb==2.0.0
+sqlglot==30.33.0
+pandas==3.0.5
+numpy==2.5.3
+plotly==7.1.0
+streamlit==1.67.0
