@@ -398,3 +398,12 @@ def test_outcome_split_is_exact():
     parts = [float(x) for x in _re.findall(r"([+-]\d+\.\d+) pts", split)]
     head = float(_re.search(r"\(([+-]\d+\.\d+) pts\)", a.headline).group(1))
     assert len(parts) == 3 and abs(sum(parts) - head) <= 0.02   # 2-dp rounding only
+
+
+def test_auth_config_problem_is_reported_not_hidden(tmp_path):
+    from analyst.auth import config_problem
+    assert config_problem() is None                                    # shipped demo file is valid
+    assert "No users file" in config_problem(str(tmp_path / "missing.json"))
+    empty = tmp_path / "empty.json"
+    empty.write_text('{"users": []}')
+    assert "no accounts" in config_problem(str(empty))

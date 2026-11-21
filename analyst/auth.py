@@ -50,6 +50,24 @@ def load_users(path: str | None = None) -> dict[str, dict]:
     return {u["username"].lower(): u for u in data.get("users", [])}
 
 
+def config_problem(path: str | None = None) -> str | None:
+    """A setup problem that makes every sign-in fail (missing/unreadable/empty users file), or None.
+    Shown to the operator, so a misconfiguration is not reported as 'wrong password'."""
+    path = os.path.abspath(path or _users_file())
+    if not os.path.exists(path):
+        return f"No users file at {path}. Set USERS_FILE or restore config/users.demo.json."
+    try:
+        users = load_users(path)
+    except (OSError, ValueError, KeyError) as e:
+        return f"Users file {path} could not be read: {e}"
+    if not users:
+        return f"Users file {path} contains no accounts."
+    bad = [u for u, r in users.items() if r.get("role") not in ROLES or not r.get("hash") or not r.get("salt")]
+    if bad:
+        return f"Users file {path} has invalid entries (unknown role or missing hash): {', '.join(bad)}"
+    return None
+
+
 def hash_password(password: str, salt: str | None = None, iterations: int = ITERATIONS) -> dict:
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), iterations).hex()
@@ -81,8 +99,29 @@ def auth_mode() -> str:
     return os.getenv("AUTH_MODE", "password").lower()
 
 
+def _check() -> int:
+    """python -m analyst.auth check: what the app sees, and whether the demo accounts verify."""
+    path = os.path.abspath(_users_file())
+    print(f"users file : {path}")
+    print(f"exists     : {os.path.exists(path)}")
+    problem = config_problem()
+    if problem:
+        print(f"PROBLEM    : {problem}")
+        return 1
+    users = load_users()
+    print(f"accounts   : {', '.join(f'{u} ({r['role']})' for u, r in users.items())}")
+    demo = {"head.payments": "demo-head", "risk.ops": "demo-risk", "kam.a": "demo-kam"}
+    for u, pw in demo.items():
+        if u in users:
+            print(f"sign-in {u:<14}: {'OK' if verify_password(u, pw) else 'FAILED'}")
+    return 0
+
+
 def _cli(argv: list[str]) -> int:
-    """python -m analyst.auth add <username> <role> [--file path]  (prompts for the password)"""
+    """python -m analyst.auth add <username> <role> [--file path]  (prompts for the password)
+       python -m analyst.auth check"""
+    if argv[:1] == ["check"]:
+        return _check()
     if len(argv) < 3 or argv[0] != "add" or argv[2] not in ROLES:
         print(f"usage: python -m analyst.auth add <username> <role> [--file path]\nroles: {', '.join(ROLES)}")
         return 2

@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from analyst import charts
-from analyst.auth import auth_mode, user_from_headers, verify_password
+from analyst.auth import auth_mode, config_problem, user_from_headers, verify_password
 from analyst.engine import AnalystEngine
 from analyst.rbac import ROLES
 
@@ -67,6 +67,9 @@ if user is None:
         st.error("Not authenticated: no trusted identity header from the SSO proxy, or this identity has "
                  "no role assigned. Contact the data platform team.")
         st.stop()
+    problem = config_problem()
+    if problem:  # a setup error must not look like a wrong password
+        st.error(f"**Sign-in is not configured:** {problem}  \nRun `python -m analyst.auth check` for details.")
     with st.form("login"):
         st.subheader("Sign in")
         username = st.text_input("Username")
