@@ -60,9 +60,11 @@ ctx = pages.sidebar(pages.Context(eng=eng, user=user))
 role = ROLES[user.role]
 nav = st.navigation([
     st.Page(lambda: pages.ask_page(ctx), title="Ask", icon=":material/chat:", url_path="ask", default=True),
-    # the SQL console is only offered to roles allowed to run hand-written SQL (the engine enforces it too)
-    *([st.Page(lambda: pages.sql_page(ctx), title="SQL console", icon=":material/terminal:", url_path="sql")]
-      if role.can_run_sql else []),
+    # the SQL console is only listed for roles allowed to run hand-written SQL; for others the address
+    # still resolves (hidden), showing "not available for your role" rather than "page not found".
+    # The engine refuses their SQL either way.
+    st.Page(lambda: pages.sql_page(ctx), title="SQL console", icon=":material/terminal:", url_path="sql",
+            visibility="visible" if role.can_run_sql else "hidden"),
     st.Page(lambda: pages.audit_page(ctx), title="Audit log", icon=":material/history:", url_path="audit"),
 ], position="sidebar")
 nav.run()

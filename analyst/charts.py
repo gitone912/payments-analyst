@@ -119,5 +119,22 @@ def sources(spec: dict) -> go.Figure:
     return fig
 
 
+def trend_multi(spec: dict) -> go.Figure:
+    df = spec["df"].copy()
+    df["day"] = pd.to_datetime(df["day"])
+    y = spec["y"]
+    is_pct = y in ("success_rate", "success_rate_excl_pending", "failure_rate", "technical_success_rate",
+                   "technical_failure_rate", "business_decline_rate")
+    palette = [S1, S2, S3, "#EAB308", "#64748B", "#EC4899"]
+    fig = go.Figure()
+    for i, (seg, g) in enumerate(df.groupby("segment", sort=False)):
+        fig.add_scatter(x=g.day, y=g[y], name=str(seg), mode="lines", line=dict(color=palette[i % 6], width=2),
+                        hovertemplate=f"{seg}: " + ("%{y:.2%}" if is_pct else "%{y:,.0f}") + "<extra></extra>")
+    fig.update_layout(**_layout(spec["title"]))
+    _pct_axis(fig, is_pct)
+    return fig
+
+
 def render(spec: dict, dq_days=None) -> go.Figure:
-    return {"trend": lambda s: trend(s, dq_days), "contrib": contrib, "bar": bar, "sources": sources}[spec["kind"]](spec)
+    return {"trend": lambda s: trend(s, dq_days), "trend_multi": trend_multi, "contrib": contrib, "bar": bar,
+            "sources": sources}[spec["kind"]](spec)
