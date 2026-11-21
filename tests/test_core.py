@@ -525,3 +525,28 @@ def test_suggestions_only_offer_what_the_role_can_run():
         for q in suggestions_for(role):
             a = eng.ask(q, role_key, "rules")
             assert a.status != "denied", (role_key, q, a.message)
+
+
+def test_sweep_regressions_dates_metrics_names():
+    """Questions that used to get a confident answer to a different question."""
+    eng = _engine()
+    ask = lambda q: eng.ask(q, "head_of_payments", "rules")  # noqa: E731
+    for q, start, end in (("success rate on 14 Oct", "2026-10-14", "2026-10-14"),
+                          ("success rate on 2026-10-14", "2026-10-14", "2026-10-14"),
+                          ("success rate from 1 oct to 10 oct", "2026-10-01", "2026-10-10"),
+                          ("success rate 1-10 october", "2026-10-01", "2026-10-10"),
+                          ("success rate for the first week of october", "2026-10-01", "2026-10-07"),
+                          ("success rate today", "2026-10-25", "2026-10-25")):
+        p = ask(q).plan
+        assert (p["window"]["start"], p["window"]["end"]) == (start, end), q
+    a = ask("how many transactions failed yesterday")
+    assert a.plan["metric"] == "failures" and "841" in a.headline
+    assert ask("success rate by bank tier").plan["dimensions"] == ["bank_tier"]
+    assert ask("success rate by week").plan["dimensions"] == ["week"]
+    assert ask("success rate trend by method").charts[0]["kind"] == "trend_multi"
+    assert ask("top failure reasons last week").plan["metric"] == "failures"
+    assert ask("Success rate for delta coop bank last week").plan["filters"] == {"bank": ["Delta Co-op Bank"]}
+    assert ask("Why has the success rate gone down recently?").plan["intent"] == "diagnose_change"
+    assert ask("success rate last month").plan["baseline"] is None      # no 1-day 'previous month'
+    assert "lowest UPI" not in ask("success rate for upi").headline      # one segment is not ranked
+    assert "GMV (INR)" in ask("daily gmv trend").headline

@@ -1,7 +1,7 @@
 {
   "planner": "rules",
-  "run_at": "2026-11-21T14:59:36+00:00",
-  "commit": "a9d8503",
+  "run_at": "2026-11-21T17:21:45+00:00",
+  "commit": "93d7c70",
   "llm": null,
   "core": {
     "passed": 41,
@@ -217,7 +217,7 @@
     ]
   },
   "paraphrases": {
-    "passed": 8,
+    "passed": 9,
     "total": 10,
     "provider_errors": 0,
     "cases": [
@@ -268,8 +268,8 @@
       },
       {
         "question": "Top failure reasons last week",
-        "result": "FAIL",
-        "detail": "status clarify; intent clarify; dims []"
+        "result": "PASS",
+        "detail": ""
       }
     ]
   }

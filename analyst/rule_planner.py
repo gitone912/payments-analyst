@@ -32,7 +32,7 @@ DIM_PATTERNS = [
     ("method", r"\b(method|methods|payment method|instrument|mode|modes)\b"),
     ("merchant", r"\b(merchant|merchants)\b"),
     ("category", r"\b(category|categories|vertical|verticals|segment|segments)\b"),
-    ("city_tier", r"\b(city|cities|city tier|tier)\b"),
+    ("city_tier", r"\b(city|cities|city tier)\b|(?<!bank )\btiers?\b"),
     ("hour", r"\b(hour|hourly|time of day)\b"),
 ]
 METHOD_ALIASES = {"upi": "UPI", "card": "Card", "cards": "Card", "credit card": "Card",
@@ -40,6 +40,11 @@ METHOD_ALIASES = {"upi": "UPI", "card": "Card", "cards": "Card", "credit card": 
                   "nb": "NetBanking", "wallet": "Wallet", "wallets": "Wallet"}
 
 
+_MON = (r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+        r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_DAY = r"(\d{1,2})(?:st|nd|rd|th)?"
+_MON_NUM = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+                                         "nov", "dec"], 1)}
 _TIME_UNIT = r"(?:days?|weeks?|months?|years?|hours?|mins?|minutes?)"
 _NUM = r"(?:₹|rs\.?\s*|inr\s*)?\d[\d,]*(?:\.\d+)?\s*(?:k|lakh|inr|rupees|rs)?"
 _CONDITION_PATTERNS = [
@@ -150,13 +155,19 @@ raw duplicate duplicates duplicated ingested dedup deduplicated
 action actions recommend recommended recommendation recommendations next step steps take should
 done fix
 performance performing perform doing approval conversion
-technical business tsr outcome outcomes type types
+technical business tsr outcome outcomes type types first second third fourth final recently lately
+recent until till from today
 compared comparing against relative break broke broken traffic you your not only own there their
 more less very really both other others look looking need want know let like check still even
 """.split())
 _JANUARY_TO_DECEMBER = ("january february march april may june july august september october november "
                         "december jan feb mar apr jun jul aug sep sept oct nov dec").split()
 _KNOWN_WORDS.update(_JANUARY_TO_DECEMBER)
+
+
+def _plain(text: str) -> str:
+    """Lowercase, punctuation inside words removed ('Co-op' -> 'coop'), single spaces."""
+    return " ".join(re.sub(r"[^a-z0-9]", "", w) for w in text.lower().split())
 
 
 def unrecognised_terms(question: str, extra_known: set[str] = frozenset()) -> list[str]:
@@ -287,6 +298,55 @@ class RulePlanner:
             return m
         return None
 
+    def _days(self, q: str, notes: list[str]):
+        """Specific days and day ranges: '14 Oct', 'Oct 14th', '2026-10-14', '1 oct to 10 oct',
+        '1-10 October', 'first week of October'. Returns (window, baseline) or None."""
+        year = int(self._year(q).group(1)) if self._year(q) else self.data_end.year
+
+        def mk(day, mon):
+            try:
+                return date(year, _MON_NUM[mon[:3]], int(day))
+            except ValueError:
+                return None
+        m = re.search(rf"\b(first|1st|second|2nd|third|3rd|fourth|4th|last|final)\s+week\s+of\s+{_MON}\b", q)
+        if m:
+            mi = _MON_NUM[m.group(2)[:3]]
+            month_end = (date(year, mi + 1, 1) if mi < 12 else date(year + 1, 1, 1)) - timedelta(days=1)
+            k = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2, "fourth": 3, "4th": 3}.get(m.group(1))
+            w = (Window(date(year, mi, 1 + 7 * k), date(year, mi, 7 + 7 * k)) if k is not None
+                 else Window(month_end - timedelta(days=6), month_end))
+            notes.append(f"'{m.group(0)}' = {w.label()}, compared with the 7 days before.")
+            return w, self._prev(w)
+        pairs = [  # ranges first, so '1 oct to 10 oct' is not read as the single day '1 oct'
+            (rf"\b{_DAY}\s+{_MON}\s*(?:-|–|to|till|until|and)\s*{_DAY}\s+{_MON}\b", (0, 1, 2, 3)),
+            (rf"\b{_MON}\s+{_DAY}\s*(?:-|–|to|till|until|and)\s*{_MON}\s+{_DAY}\b", (1, 0, 3, 2)),
+            (rf"\b{_DAY}\s*(?:-|–|to|till|until|and)\s*{_DAY}\s+{_MON}\b", (0, 2, 1, 2)),
+            (rf"\b{_MON}\s+{_DAY}\s*(?:-|–|to|till|until|and)\s*{_DAY}\b", (1, 0, 2, 0)),
+        ]
+        for pat, (d1, m1, d2, m2) in pairs:
+            m = re.search(pat, q)
+            if m:
+                g = m.groups()
+                a, b = mk(g[d1], g[m1]), mk(g[d2], g[m2])
+                if a and b and a <= b:
+                    w = Window(a, b)
+                    notes.append(f"{w.label()} compared with the preceding {w.days()} days.")
+                    return w, self._prev(w)
+        iso = re.findall(r"(\d{4}-\d{2}-\d{2})", q)
+        single = None
+        if len(iso) == 1:
+            single = date.fromisoformat(iso[0])
+        else:
+            m = re.search(rf"\b{_DAY}\s+(?:of\s+)?{_MON}\b", q) or re.search(rf"\b{_MON}\s+{_DAY}\b(?!\s*,?\s*\d)", q)
+            if m:
+                g = m.groups()
+                single = mk(g[0], g[1]) if g[0].isdigit() else mk(g[1], g[0])
+        if single:
+            w = Window(single, single)
+            notes.append(f"{single:%d %b %Y} compared with the same weekday a week earlier.")
+            return w, Window(single - timedelta(days=7), single - timedelta(days=7))
+        return None
+
     def parse_time(self, q: str) -> tuple[Window | None, Window | None, list[str]]:
         notes: list[str] = []
         ref = self.data_end
@@ -295,6 +355,17 @@ class RulePlanner:
             w = Window(date.fromisoformat(iso[0]), date.fromisoformat(iso[1]))
             b = Window(date.fromisoformat(iso[2]), date.fromisoformat(iso[3])) if len(iso) >= 4 else None
             return w, b, notes
+        days = self._days(q, notes)
+        if days:
+            return days[0], days[1], notes
+        if re.search(r"\btoday\b", q):
+            w = Window(ref, ref)
+            notes.append("'Today' = the last day in the data; compared with the same weekday a week earlier.")
+            return w, Window(ref - timedelta(days=7), ref - timedelta(days=7)), notes
+        if re.search(r"\b(recently|lately|recent)\b", q):
+            notes.append(f"'Recently' read as the most recent full week ({self._week(0).label()}), "
+                         f"compared with the week before.")
+            return self._week(0), self._week(1), notes
         if re.search(r"\b(last|past|previous) week\b|\bweek over week\b|\bwow\b|\bthis week\b", q):
             notes.append(f"'Last week' = the most recent full week in the data ({self._week(0).label()}), "
                          f"compared with the week before.")
@@ -318,7 +389,12 @@ class RulePlanner:
         if re.search(r"\blast month\b", q):
             end = ref.replace(day=1) - timedelta(days=1)
             w = Window(end.replace(day=1), end)
-            return w, self._prev(w), notes
+            prev_end = w.start - timedelta(days=1)
+            b = Window(max(prev_end.replace(day=1), self.data_start), prev_end)
+            if b.days() < 7:  # a 1-day 'previous month' is not a fair comparison
+                notes.append(f"{w.label()}; no comparison, because the data starts on {self.data_start:%d %b}.")
+                return w, None, notes
+            return w, b, notes
         yr = self._year(q)
         year = int(yr.group(1)) if yr else ref.year
         found = [(MONTHS[mo], mo) for mo in MONTHS if re.search(rf"\b{mo}\b|\b{mo[:3]}\b", q)]
@@ -326,16 +402,19 @@ class RulePlanner:
             return Window(date(year, 1, 1), date(year, 12, 31)), None, notes
         if found:
             found.sort()
-            def mwin(mi):
+            def mwin(mi, note=True):
                 s = date(year, mi, 1)
                 e = (date(year, mi + 1, 1) if mi < 12 else date(year + 1, 1, 1)) - timedelta(days=1)
                 if e < self.data_start or s > self.data_end:
                     return Window(s, e)  # outside data: engine turns this into a clarification
-                return Window(max(s, self.data_start), min(e, self.data_end))
+                clipped = Window(max(s, self.data_start), min(e, self.data_end))
+                if note and (clipped.start, clipped.end) != (s, e) and clipped.days() < 7:
+                    notes.append(f"The data only covers {clipped.label()} of {s:%B %Y}.")
+                return clipped
             if len(found) >= 2:
-                return mwin(found[-1][0]), mwin(found[0][0]), notes
+                return mwin(found[-1][0]), mwin(found[0][0], note=False), notes
             w = mwin(found[0][0])
-            b = mwin(found[0][0] - 1) if found[0][0] > 1 else None
+            b = mwin(found[0][0] - 1, note=False) if found[0][0] > 1 else None
             if b and (b.end < self.data_start or b.start > self.data_end):
                 b = None
             if b and b.start == self.data_start and b.days() < 7:
@@ -367,8 +446,10 @@ class RulePlanner:
             metric = "success_rate_excl_pending"
         elif re.search(r"success rate|\bsr\b|success ratio|success %", q):
             metric = "success_rate"
-        elif re.search(r"failure rate|fail rate|failures", q):
+        elif re.search(r"failure rate|fail rate", q):
             metric = "failure_rate"
+        elif re.search(r"\b(failures|failed)\b", q):
+            metric = "failures"  # 'how many failed', 'most failures': a count, not a rate
         elif re.search(r"\bgmv\b|\btpv\b|revenue|value processed|amount", q):
             metric = "gmv"
         elif re.search(r"average ticket|avg ticket|\baov\b|ticket size", q):
@@ -384,6 +465,8 @@ class RulePlanner:
             metric = metric or "success_rate"
         elif re.search(r"\b(" + "|".join(DIAG_WORDS) + r")\w*\b", strip_metric_names(q)):
             intent = "diagnose_change"
+        elif re.search(r"\b(by week|weekly|per week|each week|week by week)\b", q):
+            intent = "breakdown"  # weekly values: a breakdown by week, not a daily trend
         elif any(w in q for w in TREND_WORDS):
             intent = "trend"
         else:
@@ -404,6 +487,9 @@ class RulePlanner:
             if inherited:
                 assumptions.append(f"Follow-up to the previous question: kept its {', '.join(inherited)}.")
 
+        if metric is None and re.search(r"\bfailure reasons?\b|\b(error|decline) codes?\b", q):
+            metric = "failures"
+            assumptions.append("Failure reasons ranked by number of failed attempts.")
         if metric is None:
             if intent == "diagnose_change" and re.search(r"success|fail", q):
                 metric = "success_rate"
@@ -422,12 +508,14 @@ class RulePlanner:
                 filters.setdefault("method", [])
                 if canon not in filters["method"]:
                     filters["method"].append(canon)
+        qn = _plain(q)  # 'Delta Coop' and 'Delta Co-op' name the same bank
         for b in self.banks:
             short = b.lower().replace(" bank", "").replace(" federal", "").replace(" public", "").strip()
-            if b.lower() in q or re.search(rf"\b{re.escape(short)}\b", q):
+            if b.lower() in q or re.search(rf"\b{re.escape(short)}\b", q) or \
+                    re.search(rf"\b{re.escape(_plain(short))}\b", qn):
                 filters.setdefault("bank", []).append(b)
         for mname in self.merchants:
-            if re.search(rf"\b{re.escape(mname.lower())}\b", q):
+            if re.search(rf"\b{re.escape(mname.lower())}\b", q) or re.search(rf"\b{re.escape(_plain(mname))}\b", qn):
                 filters.setdefault("merchant", []).append(mname)
         for c in self.categories:
             if re.search(rf"\b{re.escape(c.replace('_', ' '))}\b|\b{c}\b", q):
@@ -463,6 +551,8 @@ class RulePlanner:
             metric = "attempts"  # a status-based rate is 0/100% inside each outcome type: show volumes
             assumptions.append("Split by outcome type shows attempts per type (technical failure, business "
                                "decline, pending, success).")
+        if re.search(r"\b(by week|weekly|per week|each week|week by week)\b", q) and "week" not in dims:
+            dims.insert(0, "week")
         use_raw = bool(re.search(r"\braw\b|including duplicates|with duplicates", q)) or bool(prev and prev.use_raw)
 
         # time window handling
@@ -475,6 +565,9 @@ class RulePlanner:
             if intent == "trend":
                 window = Window(self.data_start, self.data_end)
                 assumptions.append(f"No period given; showing the full dataset ({window.label()}).")
+            elif "week" in dims or "day" in dims:
+                window = Window(self.data_start, self.data_end)
+                assumptions.append(f"No period given; showing every week in the data ({window.label()}).")
             else:
                 window = Window(self.data_end - timedelta(days=6), self.data_end)
                 assumptions.append(f"No period given; assumed the last 7 days in the data ({window.label()}).")

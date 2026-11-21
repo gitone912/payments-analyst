@@ -15,6 +15,8 @@ class Window:
     end: date  # inclusive
 
     def label(self) -> str:
+        if self.start == self.end:
+            return f"{self.start:%d %b %Y}"
         return f"{self.start:%d %b} - {self.end:%d %b %Y}"
 
     def days(self) -> int:

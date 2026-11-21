@@ -68,11 +68,15 @@ def two_period_segments(plan: Plan, dims: list[str]) -> str:
             f"GROUP BY 1, 2").replace("\n\n", "\n")
 
 
-def daily_trend(plan: Plan, window: Window) -> str:
+def daily_trend(plan: Plan, window: Window, dims: list[str] | None = None) -> str:
+    """Daily values; with dims, one series per segment (column 'segment')."""
     m = METRICS[plan.metric]
-    return (f"SELECT CAST(t.created_at AS DATE) AS day, {m.sql} AS {m.key}, COUNT(*) AS attempts\n"
-            f"FROM {fact_table(plan)} t\n{_joins([], plan.filters)}\n"
-            f"WHERE {_win(window)}{_filters(plan.filters)}\nGROUP BY 1 ORDER BY 1").replace("\n\n", "\n")
+    dims = dims or []
+    seg = (" || ' · ' || ".join(f"CAST({DIMENSIONS[d].sql} AS VARCHAR)" for d in dims) + " AS segment, ") if dims else ""
+    group = "1, 2" if dims else "1"
+    return (f"SELECT CAST(t.created_at AS DATE) AS day, {seg}{m.sql} AS {m.key}, COUNT(*) AS attempts\n"
+            f"FROM {fact_table(plan)} t\n{_joins(dims, plan.filters)}\n"
+            f"WHERE {_win(window)}{_filters(plan.filters)}\nGROUP BY {group} ORDER BY {group}").replace("\n\n", "\n")
 
 
 def source_reconciliation(plan: Plan) -> str:

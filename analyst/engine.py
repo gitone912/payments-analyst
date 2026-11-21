@@ -46,6 +46,11 @@ def fmt(metric: str, v: float) -> str:
     return f"{v:,.0f}"
 
 
+def _lc(label: str) -> str:
+    """Lower-case a metric label for use mid-sentence, keeping acronyms ('GMV (INR)', not 'gmv (inr)')."""
+    return label if re.search(r"[A-Z]{2,}", label) else label.lower()
+
+
 def pts(v: float) -> str:
     return f"{v * 100:+.2f} pts"
 
@@ -115,7 +120,10 @@ class AnalystEngine:
         self.known_names: set[str] = set()
         tiers = self.ex.raw("SELECT DISTINCT city_tier FROM raw.merchants").city_tier.tolist()
         for n in [*m.merchant_name, *cats, *banks, *tiers]:
-            self.known_names.update(re.findall(r"[a-z][a-z0-9]*", str(n).lower().replace("_", " ")))
+            text = str(n).lower().replace("_", " ")
+            self.known_names.update(re.findall(r"[a-z][a-z0-9]*", text))
+            for w in text.split():  # 'co-op' and 'coop' as typed, not only 'co' + 'op'
+                self.known_names.update({w, re.sub(r"[^a-z0-9]", "", w)})
         self.llm = LLMPlanner(self.data_start, self.data_end, banks, cats, provider=llm_provider)
         self.dq: list[DQFinding] = run_checks(self.ex)
 
@@ -574,7 +582,7 @@ class AnalystEngine:
         tr, q_tr = self._run(ans, role, compiler.daily_trend(trend_plan, Window(b.start, w.end)),
                              "Daily trend across both periods")
         ans.tables["Daily trend"] = tr
-        ans.charts.append({"kind": "trend", "title": f"Daily {m.label.lower()}", "df": tr, "x": "day",
+        ans.charts.append({"kind": "trend", "title": f"Daily {_lc(m.label)}", "df": tr, "x": "day",
                            "y": m.key, "metric": m.key, "windows": {"baseline": b, "current": w}})
 
         if not m.is_rate:
@@ -628,7 +636,7 @@ class AnalystEngine:
         self._fact(ans, f"Split by {primary_key}: traffic-mix shift accounts for {pts(mix_pts)} "
                    f"({P.mix_share:.0%} of the change) and within-segment rate changes for {pts(rate_pts)}.",
                    recs[primary_key])
-        self._fact(ans, f"Like-for-like: at the baseline traffic mix, the current period's {m.label.lower()} "
+        self._fact(ans, f"Like-for-like: at the baseline traffic mix, the current period's {_lc(m.label)} "
                    f"would be {fmt(m.key, lfl)} ({pts(lfl - ra)} vs baseline) instead of {fmt(m.key, rb)}.",
                    recs[primary_key])
 
@@ -644,7 +652,7 @@ class AnalystEngine:
             seg.mix_effect.abs().sort_values(ascending=False).index).dropna(subset=["mix_effect"])
         mix_top = mix_top[(mix_top.mix_effect * d > 0) & (mix_top.mix_effect.abs() >= max(0.001, 0.1 * abs(d)))].head(2)
         for r in mix_top.itertuples():
-            self._fact(ans, f"{r.segment}: share of attempts {r.w_a:.1%} → {r.w_b:.1%}; its {m.label.lower()} "
+            self._fact(ans, f"{r.segment}: share of attempts {r.w_a:.1%} → {r.w_b:.1%}; its {_lc(m.label)} "
                        f"{fmt(m.key, r.r_a)} → {fmt(m.key, r.r_b)} vs overall baseline {fmt(m.key, ra)}. "
                        f"Mix effect {pts(r.mix_effect)}.", recs[primary_key])
 
@@ -684,7 +692,7 @@ class AnalystEngine:
             if len(picked) == 2:
                 break
         for k, r in picked:
-            self._fact(ans, f"Genuine performance change in {r.segment} ({k}): {m.label.lower()} "
+            self._fact(ans, f"Genuine performance change in {r.segment} ({k}): {_lc(m.label)} "
                        f"{fmt(m.key, r.r_a)} → {fmt(m.key, r.r_b)} (z = {r.z_rate:.1f}), "
                        f"rate effect {pts(r.rate_effect)}.", recs[k])
             reason_tbl = self._failure_reasons(plan, role, ans, r.segment, k)
@@ -741,7 +749,7 @@ class AnalystEngine:
             if days:
                 level = "medium"
                 reasons.append(f"Incomplete data on {', '.join(f'{x:%d %b}' for x in days)} falls in the "
-                               f"{nm} period, so that period's {m.label.lower()} carries a time-of-day bias.")
+                               f"{nm} period, so that period's {_lc(m.label)} carries a time-of-day bias.")
         if any("missing bank" in c for c in ans.caveats):
             reasons.append("Some bank_id values missing in window (small).")
         reasons.append("Driver attribution is descriptive (decomposition), not causal; causes are hypotheses.")
@@ -828,10 +836,25 @@ class AnalystEngine:
                 "Raw table includes duplicate rows." if plan.use_raw else "Direct aggregate from the de-duplicated table."]}
             return
 
+        if "failure_reason" in dims:  # successes have no failure reason; they are not a 'reason'
+            cur = cur[cur["failure_reason"] != "(not failed)"].reset_index(drop=True)
+            ans.tables[next(reversed(ans.tables))] = cur
+        if len(cur) == 1:  # one segment (e.g. 'success rate for UPI'): state it, don't rank it
+            r0 = cur.iloc[0]
+            seg = " · ".join(str(r0[d]) for d in dims)
+            ans.headline = (f"{m.label} for {seg}, {plan.window.label()}: {fmt(m.key, r0[m.key])}"
+                            + (f" over {int(r0['attempts']):,} attempts" if "attempts" in cur and m.is_rate else "")
+                            + (f". Baseline ({plan.baseline.label()}): {fmt(m.key, r0[f'{m.key}_baseline'])}"
+                               if "change" in cur and pd.notna(r0.get(f"{m.key}_baseline")) else "") + ".")
+            self._fact(ans, ans.headline, q1)
+            ans.confidence = {"level": "medium" if plan.use_raw else "high", "reasons": [
+                "Raw table includes duplicate rows." if plan.use_raw else "Direct aggregate from the de-duplicated table."]}
+            return
         ans.charts.append({"kind": "bar", "title": f"{m.label} by {' × '.join(DIMENSIONS[d].label for d in dims)}",
                            "df": cur, "x": dims[0], "y": m.key, "metric": m.key, "color": dims[1] if len(dims) > 1 else None})
         s = cur.sort_values(m.key, ascending=False)
-        lab = lambda r: " · ".join(str(r[d]) for d in dims)  # noqa: E731
+        def lab(r):  # readable segment labels; dates (e.g. week starting) as '28 Sep'
+            return " · ".join(f"{pd.Timestamp(r[d]):%d %b}" if d in ("week", "day") else str(r[d]) for d in dims)
         best, worst = s.iloc[0], s.iloc[-1]
         ans.headline = (f"{m.label} by {', '.join(DIMENSIONS[d].label.lower() for d in dims)} "
                         f"for {plan.window.label()}: highest {lab(best)} ({fmt(m.key, best[m.key])}), "
@@ -850,12 +873,32 @@ class AnalystEngine:
     # ------------------------------------------------------------ trend
     def _trend(self, plan: Plan, role: Role, ans: Answer) -> None:
         m = METRICS[plan.metric]
+        dims = [d for d in plan.dimensions if d not in ("day", "week")][:1]
+        if dims:  # 'trend by method': one line per segment instead of silently dropping the split
+            df, rec = self._run(ans, role, compiler.daily_trend(plan, plan.window, dims),
+                                f"Daily trend by {DIMENSIONS[dims[0]].label.lower()}")
+            vol = df.groupby("segment").attempts.sum().sort_values(ascending=False)
+            keep = list(vol.index[:6])
+            df = df[df.segment.isin(keep)].reset_index(drop=True)
+            ans.tables[f"Daily trend by {DIMENSIONS[dims[0]].label.lower()}"] = df
+            title = f"Daily {_lc(m.label)} by {DIMENSIONS[dims[0]].label.lower()}"
+            ans.charts.append({"kind": "trend_multi", "title": title, "df": df, "y": m.key, "metric": m.key})
+            avg = (df.groupby("segment")[m.key].mean() if m.is_rate else df.groupby("segment")[m.key].sum())
+            hi, lo = avg.idxmax(), avg.idxmin()
+            how = "average" if m.is_rate else "total"
+            ans.headline = (f"{title}, {plan.window.label()}: highest {how} {hi} ({fmt(m.key, avg[hi])}), "
+                            f"lowest {lo} ({fmt(m.key, avg[lo])}).")
+            self._fact(ans, ans.headline, rec)
+            if len(vol) > len(keep):
+                ans.caveats.append(f"Showing the {len(keep)} largest of {len(vol)} segments by volume.")
+            ans.confidence = {"level": "high", "reasons": ["Direct daily aggregates per segment."]}
+            return
         df, rec = self._run(ans, role, compiler.daily_trend(plan, plan.window), "Daily trend")
         ans.tables["Daily trend"] = df
-        ans.charts.append({"kind": "trend", "title": f"Daily {m.label.lower()}", "df": df, "x": "day",
+        ans.charts.append({"kind": "trend", "title": f"Daily {_lc(m.label)}", "df": df, "x": "day",
                            "y": m.key, "metric": m.key, "windows": {}})
         hi, lo = df.loc[df[m.key].idxmax()], df.loc[df[m.key].idxmin()]
-        ans.headline = (f"Daily {m.label.lower()} {plan.window.label()}: ranged from {fmt(m.key, lo[m.key])} "
+        ans.headline = (f"Daily {_lc(m.label)} {plan.window.label()}: ranged from {fmt(m.key, lo[m.key])} "
                         f"({pd.Timestamp(lo.day):%d %b}) to {fmt(m.key, hi[m.key])} ({pd.Timestamp(hi.day):%d %b}).")
         self._fact(ans, ans.headline, rec)
         if len(df) >= 14 and m.is_rate:
