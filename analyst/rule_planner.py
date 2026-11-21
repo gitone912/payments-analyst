@@ -170,6 +170,20 @@ def _plain(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]", "", w) for w in text.lower().split())
 
 
+_DATA_CUES = re.compile(
+    r"success|fail|declin|gmv|tpv|revenue|volume|attempt|transaction|payment|\btxns?\b|ticket|amount|"
+    r"settle|reconcil|bank|issuer|upi|card|wallet|net ?banking|\bnb\b|merchant|categor|method|city|tier|"
+    r"pending|reason|vpa|customer|rate|raw|duplicate|trend|daily|weekly|"
+    r"today|yesterday|week|month|year|day|\b\d{4}-\d{2}-\d{2}\b|" + _MON)
+
+
+def mentions_data(question: str, extra_known: set[str] = frozenset()) -> bool:
+    """Does the question mention anything this data is about (a measure, a payment term, a bank, method,
+    merchant or period)? 'What improvement are we providing?' does not: it is out of scope, not unclear."""
+    q = question.lower()
+    return bool(_DATA_CUES.search(q)) or any(w in extra_known for w in re.findall(r"[a-z][a-z0-9-]*", q))
+
+
 def unrecognised_terms(question: str, extra_known: set[str] = frozenset()) -> list[str]:
     """Content words in the question that no planner rule accounts for (names of banks, merchants and
     categories are passed in as extra_known). Words inside detected conditions are left to that check."""

@@ -27,7 +27,7 @@ from .llm import LLMCall, LLMPlanner, plan_from_json
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
 from .rule_planner import (RulePlanner, is_followup, metric_ambiguity, premise_direction,
-                           unmodelled_conditions, unrecognised_terms, correct_spelling,
+                           unmodelled_conditions, unrecognised_terms, correct_spelling, mentions_data,
                            split_question)
 from .semantic import DIMENSIONS, METRICS
 from .sqlfix import fix_inclusive_end_dates
@@ -155,6 +155,10 @@ class AnalystEngine:
             ans.steps.append(Step("follow_up", "ok", f"treated as a follow-up to: {previous.get('question', '')}"))
         plan = self._make_plan(question, ans, mode)
         plan = self._coverage_guard(question, plan, ans, mode)
+        if plan.intent == "clarify" and ans.prev_plan is None and not mentions_data(question, self.known_names):
+            # 'who are you', 'hello': not unclear, just not a question about this data
+            ans.steps.append(Step("scope", "off_topic", "question mentions no measure, payment term or period"))
+            return self._off_topic(plan)
         if ans.planner_used.startswith("LLM") and plan.intent != "clarify":
             plan = self._period_guard(question, plan, ans, mode)
         return plan
@@ -231,6 +235,16 @@ class AnalystEngine:
         ans.planner_used = "Deterministic rule planner (LLM plan rejected by period check)"
         return self._coverage_guard(question, self.rules.plan(question, ans.prev_plan), ans, "rules")
 
+    @staticmethod
+    def _off_topic(plan: Plan) -> Plan:
+        return Plan(intent="clarify", metric=plan.metric, clarification={
+            "question": ("That's outside what I can answer. I answer questions about payment performance in "
+                         "this data: success and failure rates, GMV, volume and failure reasons, by bank, "
+                         "payment method, merchant, category or period. Try one of these:"),
+            "options": ["Why did success rate drop last week?", "Success rate by bank last week",
+                        "Top failure reasons last week"],
+            "standalone": True})  # options are complete questions, not additions to this one
+
     def _coverage_guard(self, question: str, plan: Plan, ans: Answer, mode: str) -> Plan:
         """A catalog plan that silently drops a condition ("above 5000 INR") answers a different
         question with full confidence. Detect that and route to guarded LLM SQL, or ask."""
@@ -261,6 +275,8 @@ class AnalystEngine:
         ans.steps.append(Step("coverage_guard", "clarify", "no plan applies every condition; asking"))
         cond = "; ".join(g.split(": ", 1)[-1] for g in gaps)
         unknown = all(g.startswith("unrecognised term") for g in gaps)
+        if unknown and not mentions_data(question, self.known_names):
+            return self._off_topic(plan)
         return Plan(intent="clarify", metric=plan.metric, clarification={
             "question": (f"I don't know how to apply {cond} to this data, and I won't answer while ignoring it. "
                          "Rephrase using metrics, banks, methods, merchants, categories or dates, or enable "
