@@ -1,0 +1,286 @@
+{
+  "planner": "llm",
+  "run_at": "2026-11-21T14:37:01+00:00",
+  "commit": "a92e159-dirty",
+  "llm": {
+    "provider": "gemini",
+    "models": [
+      "gemini-3.5-flash-lite",
+      "gemini-3.1-flash-lite"
+    ],
+    "answered_by": {
+      "gemini-3.5-flash-lite": 27,
+      "gemini-3.1-flash-lite": 6
+    }
+  },
+  "core": {
+    "passed": 41,
+    "total": 41,
+    "provider_errors": 0,
+    "wrong": 0,
+    "cases": [
+      {
+        "id": "headline_wow",
+        "result": "PASS",
+        "description": "headline matches ground truth 87.51% -> 84.92%"
+      },
+      {
+        "id": "driver_mix",
+        "result": "PASS",
+        "description": "identifies Delta Co-op UPI mix shift (planted)"
+      },
+      {
+        "id": "driver_surge",
+        "result": "PASS",
+        "description": "identifies QuickTix volume surge (planted)"
+      },
+      {
+        "id": "driver_rate",
+        "result": "PASS",
+        "description": "identifies Coastal NB genuine degradation (planted)"
+      },
+      {
+        "id": "no_false_rate_driver",
+        "result": "PASS",
+        "description": "does not mislabel the mix shift as a UPI rate drop"
+      },
+      {
+        "id": "dq_dups_caveat",
+        "result": "PASS",
+        "description": "duplicate records surfaced as caveat"
+      },
+      {
+        "id": "dq_gap_caveat",
+        "result": "PASS",
+        "description": "missing-data day surfaced as caveat"
+      },
+      {
+        "id": "raw_vs_clean",
+        "result": "PASS",
+        "description": "raw success rate 84.15%"
+      },
+      {
+        "id": "breakdown_method",
+        "result": "PASS",
+        "description": "UPI 85.06% / Card 88.88% in October"
+      },
+      {
+        "id": "single_number",
+        "result": "PASS",
+        "description": "September success rate 87.41%"
+      },
+      {
+        "id": "bank_breakdown",
+        "result": "PASS",
+        "description": "Delta Co-op last week 71.32%"
+      },
+      {
+        "id": "ambiguous_time",
+        "result": "PASS",
+        "description": "asks which period"
+      },
+      {
+        "id": "ambiguous_metric",
+        "result": "PASS",
+        "description": "asks which metric/denominator"
+      },
+      {
+        "id": "out_of_range",
+        "result": "PASS",
+        "description": "refuses period outside data"
+      },
+      {
+        "id": "pii_denied",
+        "result": "PASS",
+        "description": "PII blocked for non-risk role"
+      },
+      {
+        "id": "pii_allowed",
+        "result": "PASS",
+        "description": "PII allowed for risk ops"
+      },
+      {
+        "id": "row_scope_denied",
+        "result": "PASS",
+        "description": "merchant outside portfolio blocked"
+      },
+      {
+        "id": "row_scope_applied",
+        "result": "PASS",
+        "description": "portfolio-scoped results only"
+      },
+      {
+        "id": "sources_disagree",
+        "result": "PASS",
+        "description": "explains source disagreement"
+      },
+      {
+        "id": "custom_sql_share",
+        "result": "PASS",
+        "description": "amount threshold applied, not dropped (share 2.90%)"
+      },
+      {
+        "id": "custom_sql_count",
+        "result": "PASS",
+        "description": "amount threshold applied, not dropped (count 1,402)"
+      },
+      {
+        "id": "premise_check",
+        "result": "PASS",
+        "description": "corrects a false premise (GMV rose)"
+      },
+      {
+        "id": "action_question",
+        "result": "PASS",
+        "description": "returns recommendations"
+      },
+      {
+        "id": "word_cond_weekend",
+        "result": "PASS",
+        "description": "weekend condition applied inside last week, 24-25 Oct (84.97%)"
+      },
+      {
+        "id": "word_cond_vague",
+        "result": "PASS",
+        "description": "vague threshold never silently ignored; definition disclosed"
+      },
+      {
+        "id": "outcome_split",
+        "result": "PASS",
+        "description": "splits the drop: technical -2.32 pts vs business -0.18 pts"
+      },
+      {
+        "id": "technical_sr",
+        "result": "PASS",
+        "description": "technical success rate excludes business declines (Delta Co-op 78.58%)"
+      },
+      {
+        "id": "unknown_term",
+        "result": "PASS",
+        "description": "an unrecognised word is never silently ignored"
+      },
+      {
+        "id": "hour_labels",
+        "result": "PASS",
+        "description": "hours shown as HH:00"
+      },
+      {
+        "id": "followup_breakdown",
+        "result": "PASS",
+        "description": "keeps metric + period from the previous question (Delta Co-op 71.32%)"
+      },
+      {
+        "id": "followup_slice",
+        "result": "PASS",
+        "description": "re-runs the diagnosis on UPI only (86.28% -> 82.72%)"
+      },
+      {
+        "id": "multi_part",
+        "result": "PASS",
+        "description": "two-part question answered separately (Delta 71.32%; ecommerce GMV Oct \u20b958,857,309)"
+      },
+      {
+        "id": "guard_delete",
+        "result": "PASS",
+        "description": "SQL guard: expect blocked"
+      },
+      {
+        "id": "guard_multi",
+        "result": "PASS",
+        "description": "SQL guard: expect blocked"
+      },
+      {
+        "id": "guard_file",
+        "result": "PASS",
+        "description": "SQL guard: expect blocked"
+      },
+      {
+        "id": "guard_schema",
+        "result": "PASS",
+        "description": "SQL guard: expect blocked"
+      },
+      {
+        "id": "guard_unlisted_fn",
+        "result": "PASS",
+        "description": "SQL guard: expect blocked"
+      },
+      {
+        "id": "guard_cartesian",
+        "result": "PASS",
+        "description": "SQL guard: expect blocked"
+      },
+      {
+        "id": "guard_star_pii",
+        "result": "PASS",
+        "description": "SQL guard: expect denied"
+      },
+      {
+        "id": "guard_ok",
+        "result": "PASS",
+        "description": "SQL guard: expect answered"
+      },
+      {
+        "id": "provider_outage",
+        "result": "PASS",
+        "description": "falls back to deterministic planner"
+      }
+    ]
+  },
+  "paraphrases": {
+    "passed": 10,
+    "total": 10,
+    "provider_errors": 0,
+    "cases": [
+      {
+        "question": "What caused the dip in payment success over the past week?",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "How did Card do compared with NetBanking in September?",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "Give me the daily success rate trend for October",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "GMV by category last week",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "Is the finance team's settlement data consistent with our transaction logs for last week?",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "Why is success rate down?",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "Success rate excluding pending for Coastal Bank last week",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "Why did success rate fall in January 2024?",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "Which merchants had the highest failure rate last week?",
+        "result": "PASS",
+        "detail": ""
+      },
+      {
+        "question": "Top failure reasons last week",
+        "result": "PASS",
+        "detail": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,56 @@
+# Design system: one accent (indigo), neutral greys, Inter, compact type scale.
+# Light and dark palettes are both defined; Streamlit follows the viewer's system setting.
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# product UI: hide Streamlit's developer toolbar (Deploy button, rerun menu) from end users
+toolbarMode = "viewer"
+
+[theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap, monospace"
+baseFontSize = 14
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
+showWidgetBorder = true
+showSidebarBorder = true
+headingFontSizes = ["1.5rem", "1.25rem", "1.0625rem", "0.9375rem", "0.875rem", "0.8125rem"]
+headingFontWeights = [650, 600, 600, 600, 600, 600]
+metricValueFontSize = "1.375rem"
+codeFontSize = "0.8125rem"
+paddingTop = "2rem"
+chartCategoricalColors = ["#4F46E5", "#F97316", "#10B981", "#EAB308", "#64748B"]
+
+[theme.light]
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F6F8"
+textColor = "#111827"
+borderColor = "#E4E4E9"
+linkColor = "#4F46E5"
+codeBackgroundColor = "#F6F6F8"
+dataframeHeaderBackgroundColor = "#F6F6F8"
+dataframeBorderColor = "#E4E4E9"
+
+[theme.light.sidebar]
+backgroundColor = "#FAFAFB"
+secondaryBackgroundColor = "#F1F1F4"
+borderColor = "#E4E4E9"
+
+[theme.dark]
+primaryColor = "#818CF8"
+backgroundColor = "#0E0F12"
+secondaryBackgroundColor = "#17181C"
+textColor = "#E8E8EC"
+borderColor = "#2A2B31"
+linkColor = "#A5B4FC"
+codeBackgroundColor = "#17181C"
+dataframeHeaderBackgroundColor = "#17181C"
+dataframeBorderColor = "#2A2B31"
+
+[theme.dark.sidebar]
+backgroundColor = "#121317"
+secondaryBackgroundColor = "#1B1C21"
+borderColor = "#2A2B31"

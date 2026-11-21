@@ -18,14 +18,22 @@ each kept separate.
 ```bash
 pip install -r requirements.txt
 python data/generate_data.py            # builds data/payments.duckdb (~285k txns, seeded)
-streamlit run app.py                    # UI at http://localhost:8501 (sign in: see below)
+python run_app.py                       # UI at http://localhost:8501 (sign in: see below)
 python evals/run_evals.py               # 40 known-answer / safety checks
 python -m pytest -q tests               # 23 unit tests
 python cli.py "why did success rate drop last week?" --sql
 python cli.py "why did success rate drop last week?" --then "now break that down by bank"
 ```
 
-Optional LLM planner (the system runs fully without one):
+`run_app.py` wraps `streamlit run app.py`. On Windows it avoids the harmless
+`ConnectionResetError [WinError 10054]` tracebacks when a browser tab closes, and Ctrl+C always
+returns within a few seconds instead of hanging on "Stopping...". If `streamlit` is "not recognized"
+on Windows, use `python -m streamlit run app.py` (or `python run_app.py`) instead.
+
+Optional LLM planner (the system runs fully without one). Easiest: copy `.env.example` to `.env`,
+put your key in it and restart; the app, CLI and LLM evals read it automatically (`.env` is git-ignored;
+variables already set in the terminal take precedence). Check it with `python -m analyst.llm_check`: one real call per
+configured model, with a plain reason if it fails (no key, key rejected, model retired, rate limit). Or set the variables yourself:
 
 ```bash
 export LLM_PROVIDER=gemini GEMINI_API_KEY=...            # default model: gemini-3.5-flash-lite
@@ -58,6 +66,40 @@ Every query is appended to `logs/audit.jsonl` (user, role, time, SQL, outcome; p
 Users see only their own entries in the Session log tab.
 
 Deep link for demos: `http://localhost:8501/?q=Why did success rate drop last week?`
+
+## Roles and what each can run
+
+Defined once in `analyst/rbac.py`, **enforced by the engine and the SQL guard** (not only hidden in
+the UI), and shown to each user in the sidebar under *Your access*.
+
+| Capability | Head of Payments | Risk Ops | KAM (Portfolio A) |
+|---|---|---|---|
+| Ask questions | all merchants | all merchants | Portfolio A merchants only |
+| Raw ingested data (`transactions_raw`, with duplicates) | yes | yes | no |
+| Customer PII (`customer_vpa`) | no | yes | no |
+| SQL console (hand-written, read-only, guarded) | yes | yes | no (not in navigation; engine refuses) |
+| Executed SQL (physical tables, row-level scope rewrite) | no | yes | no (engine strips it from answers) |
+
+Answers show Summary and Charts first; the proof (queries, result tables, trace) is in a collapsed
+*Evidence* section. The audit log always keeps the executed SQL, whatever the role sees. Suggested
+questions only include ones the signed-in role is allowed to run.
+
+## Interface
+
+A product-style UI built only on Streamlit's native theming (no extra UI dependencies):
+
+- **Navigation:** sidebar pages *Ask*, *SQL console* and *Audit log*; assistant settings
+  (planner, LLM status, outage simulation), data health and the signed-in user below them.
+- **Answers read like a short analyst report:** headline with a confidence badge and a status
+  line (planner, queries, time, model cost), then Findings (each with the query it came from),
+  Likely causes, Recommended actions, Caveats and Method; Charts, Queries, Data and Trace tabs.
+- **Design system:** `.streamlit/config.toml` (Inter, one indigo accent, neutral greys, light and
+  dark palettes, compact type scale) and `ui/theme.py` (one stylesheet for the app's own elements;
+  no selectors on Streamlit internals). Components in `ui/components.py`, screens in `ui/pages.py`,
+  the answer view in `ui/answer.py`; `app.py` only wires them together.
+- Why no shadcn/antd component libraries: `streamlit-antd-components` has had no release since
+  January 2024; `streamlit-shadcn-ui` renders each component in its own iframe, which does not follow
+  the app's light/dark theme or font. Streamlit's built-in Material icons replace Lucide.
 
 ## Architecture
 
@@ -144,6 +186,13 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
   metric, period, filters and analysis type (both planners). Standalone questions ignore it.
 - **Premise check.** "Why did GMV drop?" when GMV rose is answered with
   "Premise check: ... it actually rose" before the numbers.
+- **Provider resilience.** When the primary model is overloaded or rate-limited, the planner tries
+  backup models in order (`LLM_FALLBACK_MODELS`, default `gemini-3.1-flash-lite` for Gemini). A
+  short wait the provider asks for (Retry-After / `retryDelay`, at most `LLM_MAX_RETRY_WAIT_S`=5s) is
+  honoured once per model; longer ones are not waited for. After 3 consecutive failures a model is
+  skipped for 60s (circuit breaker, shared across users), and each request has a 20s budget
+  (`LLM_REQUEST_BUDGET_S`). At most two calls per model, then the deterministic planner takes over.
+  The trace shows which model answered.
 - **LLM robustness**: tolerant JSON parsing (trailing commas), one retry with the validation
   errors fed back, no retry on 429/5xx (falls back immediately), and an in-process plan cache so
   re-asking a question costs no quota.
@@ -154,18 +203,27 @@ Answer: facts[evidence query ids] · hypotheses · recommendations · DQ caveats
 
 Ground truth comes from hand-written SQL on the raw tables, not from the engine's compiler.
 
-| Planner | Core suite (40 known-answer + safety checks) | Held-out paraphrases (10, plan shape) |
-|---|---|---|
-| Deterministic rules | 40/40 | 8/10 (misses "Card compared with NetBanking", "Top failure reasons") |
-| Gemini `gemini-3.5-flash-lite` (live) | 32/40 on the latest run; all 8 misses were provider 503s, 0 wrong answers. The previous full run (36 checks) was 34/36, again with only provider errors | 9/10 (the miss was a 503) |
+<!-- eval-results:start -->
+<!-- generated by evals/render_results.py from evals/results/*.json; do not edit -->
+| Planner | Core checks passed | Wrong answers | Provider errors | Held-out paraphrases | Run (UTC) · commit |
+|---|---|---|---|---|---|
+| Deterministic rules | 41/41 | 0 | 0 | 8/10 | 2026-11-21 14:59 · `a9d8503` |
+| LLM (live) `gemini-3.5-flash-lite` | 41/41 | 0 | 0 | 10/10 | 2026-11-21 14:37 · `a92e159-dirty` |
+
+- Deterministic rules paraphrases not passed: "How did Card do compared with NetBanking in September?" (FAIL); "Top failure reasons last week" (FAIL)
+- LLM (live): models tried in order `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`; answers came from `gemini-3.5-flash-lite` ×27, `gemini-3.1-flash-lite` ×6.
+<!-- eval-results:end -->
 
 The core suite includes questions the catalog can't express: amount thresholds, "on weekends",
 and "high-value". With the LLM, the model writes SQL that matches the hand-written ground truth
 exactly. Without it, the engine asks instead of answering a different question. Two follow-up
 cases ("now break that down by bank", "what about UPI?") check that context carries over. The
 eval output labels provider errors (429/503) as `PROVIDER`, not `FAIL`.
-Provider errors are retried twice with a backoff (`EVAL_PROVIDER_RETRIES`, `EVAL_PROVIDER_BACKOFF_S`).
-Exit codes: `0` all passed, `1` at least one wrong answer, `3` only provider errors remain.
+The eval runner does not retry: provider resilience is the app's job (below), so the numbers show
+what a user would get. Exit codes: `0` all passed, `1` at least one wrong answer, `3` only provider
+errors remain. The table above is generated: `python evals/run_evals.py [--planner llm] --paraphrases
+--save` writes `evals/results/<planner>.json` (every case, the commit, which model answered), and
+`python evals/render_results.py` rebuilds the table (`--check` fails if the README is stale).
 
 The paraphrases were written after the prompt was finalised and are not used as prompt examples.
 They show whether the planner generalises beyond the questions it was tuned against.

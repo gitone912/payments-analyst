@@ -96,6 +96,7 @@ class Executor:
 
         cur = self._con.cursor()  # own connection handle: parallel-safe, interruptible on its own
         timer = threading.Timer(QUERY_TIMEOUT_S, cur.interrupt)
+        timer.daemon = True  # never keep the process alive on shutdown
         t0 = time.perf_counter()
         try:
             timer.start()

@@ -11,7 +11,7 @@ import json
 import numbers
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 
 import pandas as pd
@@ -27,8 +27,10 @@ from .llm import LLMCall, LLMPlanner, plan_from_json
 from .plan import Plan, Window, validate_plan
 from .rbac import ROLES, AccessDenied, Role
 from .rule_planner import (RulePlanner, is_followup, metric_ambiguity, premise_direction,
-                           unmodelled_conditions, unrecognised_terms)
+                           unmodelled_conditions, unrecognised_terms, correct_spelling,
+                           split_question)
 from .semantic import DIMENSIONS, METRICS
+from .sqlfix import fix_inclusive_end_dates
 
 COMBO_DIMS = [("bank", "method"), ("merchant", "method")]
 
@@ -46,6 +48,10 @@ def fmt(metric: str, v: float) -> str:
 
 def pts(v: float) -> str:
     return f"{v * 100:+.2f} pts"
+
+
+class LLMUnavailable(Exception):
+    """The LLM planner was required (planner = llm) but could not produce a plan."""
 
 
 @dataclass
@@ -125,6 +131,10 @@ class AnalystEngine:
         df, rec = self.ex.run(g.executable_sql, original_sql=g.original_sql, purpose=purpose,
                               role=role.key, checks=g.checks, query_id=f"Q{len(ans.queries) + 1}",
                               user=ans.user)
+        if not role.can_view_executed_sql:
+            # the executed SQL names physical tables and shows the row-level scope rewrite: keep it in
+            # the audit log (already written) but out of what this role receives
+            rec = replace(rec, executable_sql="")
         ans.queries.append(rec)
         return df, rec
 
@@ -236,7 +246,7 @@ class AnalystEngine:
                 context=ans.llm_context, simulate_outage=ans.simulate_outage)
             ans.llm_calls.extend(res.calls)
             if res.plan is not None and res.plan.intent in ("free_sql", "clarify"):
-                ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model}) - free SQL"
+                ans.planner_used = f"LLM ({self.llm.provider}:{res.model or self.llm.model}) - free SQL"
                 ans.steps.append(Step("coverage_guard", "rerouted",
                                       f"re-planned as {res.plan.intent} so every condition is applied"))
                 return res.plan
@@ -280,7 +290,10 @@ class AnalystEngine:
             res = self.llm.plan(question, context=ans.llm_context, simulate_outage=ans.simulate_outage)
             ans.llm_calls.extend(res.calls)
             if res.plan is not None:
-                ans.planner_used = f"LLM ({self.llm.provider}:{self.llm.model})"
+                ans.planner_used = f"LLM ({self.llm.provider}:{res.model or self.llm.model})"
+                if res.model and res.model != self.llm.model:
+                    ans.steps.append(Step("llm_fallback", "ok", f"primary model {self.llm.model} unavailable; "
+                                          f"answered by backup model {res.model}"))
                 ans.steps.append(Step("plan", "ok", f"{ans.planner_used}, {len(res.calls)} call(s)",
                                       (time.perf_counter() - t0) * 1000))
                 amb = metric_ambiguity(question) if ans.prev_plan is None else None
@@ -292,11 +305,15 @@ class AnalystEngine:
                 return res.plan
             reason = "; ".join(res.errors) or "no plan"
             if mode == "llm":
-                raise RuntimeError(f"LLM planner failed: {reason}")
+                raise LLMUnavailable(f"The language model could not be used ({reason}). Switch the planner to "
+                                     "'auto' to fall back to the deterministic planner.")
             ans.steps.append(Step("plan", "fallback", f"LLM planner failed ({reason}); "
                                   "fell back to deterministic planner"))
-            ans.caveats.append("The language model was unavailable or returned an invalid plan, so the "
-                               "deterministic planner was used. Supported question types still work.")
+            ans.caveats.append(
+                ("The language model key was rejected, so the deterministic planner was used. Fix "
+                 "GEMINI_API_KEY in .env (python -m analyst.llm_check shows why)." if "key rejected" in reason else
+                 "The language model was unavailable or returned an invalid plan, so the deterministic "
+                 "planner was used.") + " Supported question types still work.")
         plan = self.rules.plan(question, ans.prev_plan)
         ans.planner_used = ans.planner_used or "Deterministic rule planner"
         ans.steps.append(Step("plan", "ok", "Deterministic rule planner", (time.perf_counter() - t0) * 1000))
@@ -322,6 +339,12 @@ class AnalystEngine:
         role = ROLES[role_key]
         ans = Answer(question=question, role=role.label, user=user, simulate_outage=simulate_outage)
         try:
+            corrected, fixes = correct_spelling(question, self.known_names)
+            if fixes:  # plan on the corrected text, and say exactly what was changed
+                note = "Read " + ", ".join(f"'{a}' as '{b}'" for a, b in fixes) + "."
+                ans.question = question = corrected
+                ans.steps.append(Step("spelling", "ok", note))
+                ans.assumptions.append(note)
             plan = self.make_plan(question, ans, planner_mode, previous)
             ans.plan = plan.to_dict()
             ans.assumptions.extend(plan.assumptions)
@@ -355,6 +378,13 @@ class AnalystEngine:
                 ans.plan = plan.to_dict()
                 self._attach_dq(ans, plan)
 
+            if plan.intent == "free_sql":
+                plan.sql, fixed = fix_inclusive_end_dates(plan.sql)
+                if fixed:  # model-written SQL that would silently drop the last day of the period
+                    note = ("Adjusted the model's SQL so the last day is included: " + "; ".join(fixed) + ".")
+                    ans.steps.append(Step("sql_fix", "ok", note))
+                    ans.assumptions.append(note)
+                    ans.plan = plan.to_dict()
             handler = {"diagnose_change": self._diagnose, "breakdown": self._breakdown,
                        "trend": self._trend, "compare_sources": self._sources,
                        "free_sql": self._free_sql}[plan.intent]
@@ -384,11 +414,33 @@ class AnalystEngine:
             ans.message = f"Query cancelled: {e}. Try a narrower time window or fewer dimensions."
         except Exception as e:  # noqa: BLE001
             ans.status = "error"
-            ans.message = f"{type(e).__name__}: {e}"
+            ans.message = str(e) if isinstance(e, LLMUnavailable) else f"{type(e).__name__}: {e}"
             ans.steps.append(Step("execute", "error", ans.message))
         finally:
             ans.total_ms = (time.perf_counter() - t0) * 1000
         return ans
+
+    def ask_parts(self, question: str, role_key: str = "head_of_payments", planner_mode: str = "auto",
+                  previous: dict | None = None, *, user: str = "", simulate_outage: bool = False) -> list[Answer]:
+        """Answer a question that may contain several ("show the trend and why did it drop"): split it,
+        answer each part in order, and let each part build on the one before ("...and what about
+        failure rate?"). A single question returns a one-element list."""
+        corrected, fixes = correct_spelling(question, self.known_names)
+        parts = split_question(corrected)
+        if len(parts) == 1:
+            return [self.ask(question, role_key, planner_mode, previous, user=user, simulate_outage=simulate_outage)]
+        answers, prev = [], previous
+        for i, part in enumerate(parts, 1):
+            a = self.ask(part, role_key, planner_mode, prev, user=user, simulate_outage=simulate_outage)
+            a.steps.insert(0, Step("multi_part", "ok", f"part {i} of {len(parts)} of: {question}"))
+            if fixes:  # parts were split from the corrected text; keep the correction visible
+                note = "Read " + ", ".join(f"'{w}' as '{r}'" for w, r in fixes) + "."
+                a.steps.insert(1, Step("spelling", "ok", note))
+                a.assumptions.insert(0, note)
+            answers.append(a)
+            if a.status == "answered" and a.plan:
+                prev = {"question": a.question, "plan": a.plan}
+        return answers
 
     def run_sql(self, sql: str, role_key: str, *, user: str = "") -> Answer:
         """SQL playground: hand-written SQL gets exactly the same guard as model SQL."""
@@ -396,6 +448,9 @@ class AnalystEngine:
         ans = Answer(question=sql, role=role.label, planner_used="(hand-written SQL)", user=user)
         t0 = time.perf_counter()
         try:
+            if not role.can_run_sql:
+                raise AccessDenied(f"Role '{role.label}' cannot run hand-written SQL. Ask a question instead: "
+                                   "answers are scoped to your merchants automatically.", "sql_console")
             self._free_sql(Plan(intent="free_sql", sql=sql), role, ans)
             ans.caveats = ["Hand-written SQL: passed the safety guard; interpretation is yours."]
         except AccessDenied as e:

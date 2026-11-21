@@ -52,13 +52,99 @@ def test_unsupported_metric_rejected_then_gives_up():
 
 
 def test_provider_outage_returns_without_retry_storm():
+    """Every model down: one call per model (no wait hint -> no retry), then give up so the engine
+    falls back to the deterministic planner."""
     p = _planner()
+    p.models = ["primary", "backup"]
+    tried = []
 
-    def boom(user, *_):
+    def boom(user, outage=False, model=None):
+        tried.append(model)
         raise ProviderUnavailable("HTTP 503 from provider")
     p._complete = boom
     res = p.plan("anything")
-    assert res.plan is None and len(res.calls) == 1
+    assert res.plan is None and tried == ["primary", "backup"] and len(res.calls) == 2
+
+
+GOOD_PLAN = ('{"intent":"breakdown","metric":"success_rate","dimensions":[],"filters":{},'
+             '"window":{"start":"2026-10-19","end":"2026-10-25"},"baseline":null}')
+
+
+def test_backup_model_answers_when_primary_is_overloaded():
+    p = _planner()
+    p.models = ["primary", "backup"]
+
+    def complete(user, outage=False, model=None):
+        if model == "primary":
+            raise ProviderUnavailable("HTTP 503 from provider")
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    res = p.plan("Success rate last week")
+    assert res.plan is not None and res.model == "backup"
+    assert [c.model for c in res.calls] == ["primary", "backup"]
+
+
+def test_short_retry_after_is_honoured_then_same_model_retried():
+    p = _planner()
+    p.models = ["primary", "backup"]
+    slept, calls = [], []
+    p._sleep = slept.append
+
+    def complete(user, outage=False, model=None):
+        calls.append(model)
+        if len(calls) == 1:
+            raise ProviderUnavailable("HTTP 429 from provider", retry_after=2.0)
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    res = p.plan("Success rate last week")
+    assert slept == [2.0] and calls == ["primary", "primary"] and res.model == "primary"
+
+
+def test_long_retry_after_is_not_waited_for():
+    p = _planner()
+    p.models = ["primary", "backup"]
+    slept = []
+    p._sleep = slept.append
+
+    def complete(user, outage=False, model=None):
+        if model == "primary":
+            raise ProviderUnavailable("HTTP 429 from provider", retry_after=37.0)  # too long for a user
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    assert p.plan("Success rate last week").model == "backup" and slept == []
+
+
+def test_circuit_breaker_skips_a_failing_model_then_recovers():
+    from analyst.llm import CircuitBreaker
+    now = [0.0]
+    p = _planner()
+    p.models = ["primary", "backup"]
+    p.breaker = CircuitBreaker(threshold=3, cooldown_s=60, clock=lambda: now[0])
+    calls = []
+
+    def complete(user, outage=False, model=None):
+        calls.append(model)
+        if model == "primary":
+            raise ProviderUnavailable("HTTP 503 from provider")
+        return GOOD_PLAN, 10, 5
+    p._complete = complete
+    for i in range(3):                       # three failures open the breaker for 'primary'
+        p.plan(f"Success rate last week {i}")
+    calls.clear()
+    p.plan("Success rate last week again")
+    assert calls == ["backup"]               # primary skipped while open
+    now[0] = 61.0                            # after the cooldown it is tried again
+    calls.clear()
+    p.plan("Success rate last week later")
+    assert calls[0] == "primary"
+
+
+def test_retry_after_parsed_from_gemini_body():
+    from analyst.llm import _retry_after
+    assert _retry_after({}, b'{"details":[{"retryDelay":"36s"}]}') == 36.0
+    assert _retry_after({}, b"Please retry in 4.5s.") == 4.5
+    assert _retry_after({"Retry-After": "7"}, b"") == 7.0
+    assert _retry_after({}, b"overloaded") is None
 
 
 def test_trailing_comma_json_is_repaired():
@@ -312,3 +398,130 @@ def test_outcome_split_is_exact():
     parts = [float(x) for x in _re.findall(r"([+-]\d+\.\d+) pts", split)]
     head = float(_re.search(r"\(([+-]\d+\.\d+) pts\)", a.headline).group(1))
     assert len(parts) == 3 and abs(sum(parts) - head) <= 0.02   # 2-dp rounding only
+
+
+def test_auth_config_problem_is_reported_not_hidden(tmp_path):
+    from analyst.auth import config_problem
+    assert config_problem() is None                                    # shipped demo file is valid
+    assert "No users file" in config_problem(str(tmp_path / "missing.json"))
+    empty = tmp_path / "empty.json"
+    empty.write_text('{"users": []}')
+    assert "no accounts" in config_problem(str(empty))
+
+
+def test_spelling_is_corrected_and_disclosed():
+    from analyst.rule_planner import correct_spelling
+    eng = _engine()
+    fixed, fixes = correct_spelling("faliure rate by bnak last weak", eng.known_names)
+    assert fixed == "failure rate by bank last week" and len(fixes) == 3
+    a = eng.ask("Why did sucess rate drop last week?", "head_of_payments", "rules")
+    assert a.status == "answered" and "Success rate fell" in a.headline
+    assert any("'sucess' as 'success'" in x for x in a.assumptions)
+    # a genuinely unknown word is not "corrected" into something else: it still gets a question
+    assert correct_spelling("Success rate for premium customers", eng.known_names)[1] == []
+    assert eng.ask("Success rate for premium customers last week", "head_of_payments", "rules").status == "clarify"
+
+
+def test_multi_part_questions_are_split_and_answered_separately():
+    from analyst.rule_planner import split_question
+    # stays whole: one subject, or 'and' inside a condition or a list
+    for q in ("GMV and attempts by bank last week", "Success rate by bank and method last week",
+              "Success rate between 9am and 5pm last week", "Why did success rate drop last week?"):
+        assert split_question(q) == [q], q
+    eng = _engine()
+    a, b = eng.ask_parts("Success rate by bank last week and GMV by category in October", "head_of_payments", "rules")
+    assert (a.plan["metric"], a.plan["dimensions"]) == ("success_rate", ["bank"])
+    assert (b.plan["metric"], b.plan["dimensions"], b.plan["window"]["start"]) == ("gmv", ["category"], "2026-10-01")
+    c, d = eng.ask_parts("Why did sucess rate drop last week and what about failure rate?", "head_of_payments", "rules")
+    assert c.plan["intent"] == "diagnose_change" and d.plan["metric"] == "failure_rate"
+    assert d.plan["window"] == c.plan["window"]                       # part 2 builds on part 1
+    assert any("'sucess' as 'success'" in x for x in c.assumptions)  # correction still shown
+
+
+def test_env_file_loads_but_never_overrides(tmp_path, monkeypatch):
+    from analyst.config import load_env
+    f = tmp_path / ".env"
+    f.write_bytes("﻿# comment\nLLM_PROVIDER=gemini\nGEMINI_API_KEY=\"abc\"  # key\nexport LLM_MODEL=x\n\nBAD LINE\n".encode("utf-8"))
+    for k in ("LLM_PROVIDER", "GEMINI_API_KEY", "LLM_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("LLM_MODEL", "already-set")
+    loaded = load_env(str(f))
+    assert sorted(loaded) == ["GEMINI_API_KEY", "LLM_PROVIDER"]
+    assert os.environ["GEMINI_API_KEY"] == "abc" and os.environ["LLM_MODEL"] == "already-set"
+
+
+def test_llm_sql_inclusive_end_date_is_fixed_and_disclosed():
+    from analyst.llm import LLMResult
+    from analyst.plan import Plan
+    eng = _engine()
+    eng.llm.provider = "gemini"
+    drops_sunday = Plan(intent="free_sql", sql=(
+        "SELECT SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS success_rate_weekends "
+        "FROM transactions WHERE created_at >= '2026-10-19' AND created_at <= '2026-10-25' "
+        "AND (EXTRACT(DOW FROM created_at) = 0 OR EXTRACT(DOW FROM created_at) = 6)"))
+    eng.llm.plan = lambda q, **kw: LLMResult(plan=drops_sunday)
+    a = eng.ask("What was the success rate on weekends last week?", "head_of_payments", "llm")
+    truth = eng.ex.raw("""SELECT AVG((status='SUCCESS')::INT) AS r FROM raw.transactions_clean
+        WHERE created_at >= '2026-10-24' AND created_at < '2026-10-26'""").r[0]
+    assert a.status == "answered" and f"{truth:.2%}" in a.headline          # 84.97%, not Saturday-only
+    assert any("last day is included" in x for x in a.assumptions)
+
+
+def test_spelling_leaves_real_words_alone():
+    from analyst.rule_planner import correct_spelling
+    eng = _engine()
+    assert correct_spelling("how did sucess if defined here?", eng.known_names)[1] == [("sucess", "success")]
+    assert correct_spelling("most failurs last week", eng.known_names)[1] == [("failurs", "failures")]
+
+
+def test_every_chart_kind_renders():
+    from analyst import charts
+    eng = _engine()
+    kinds = set()
+    for q in ("Why did success rate drop last week?", "Success rate by bank last week", "Show daily success rate trend",
+              "Do settlements agree with transactions on success rate last week?",
+              "Success rate by bank and method last week"):
+        for spec in eng.ask(q, "head_of_payments", "rules").charts:
+            charts.render(spec, [])
+            kinds.add(spec["kind"])
+    assert kinds == {"trend", "contrib", "bar", "sources"}
+
+
+def test_role_capabilities_are_enforced_by_the_engine():
+    from analyst.rbac import ROLES
+    eng = _engine()
+    # SQL console: Head of Payments and Risk Ops yes, KAM no (refused by the engine, not only hidden)
+    assert eng.run_sql("SELECT COUNT(*) AS n FROM transactions", "head_of_payments").status == "answered"
+    assert eng.run_sql("SELECT COUNT(*) AS n FROM transactions", "risk_ops").status == "answered"
+    kam = eng.run_sql("SELECT COUNT(*) AS n FROM transactions", "kam_portfolio_a")
+    assert kam.status == "denied" and kam.denial_rule == "sql_console"
+    # executed SQL (physical tables + scope rewrite): only Risk Ops receives it
+    q = "Success rate by bank last week"
+    for role, visible in (("risk_ops", True), ("head_of_payments", False), ("kam_portfolio_a", False)):
+        a = eng.ask(q, role, "rules")
+        assert a.status == "answered" and all(bool(r.executable_sql) == visible for r in a.queries), role
+    # the table shown to users matches the enforced rules
+    caps = {r: {name: ok for name, ok, _ in ROLES[r].capabilities()} for r in ROLES}
+    assert caps["kam_portfolio_a"] == {"Ask questions": True, "Raw ingested data": False, "Customer PII": False,
+                                       "SQL console": False, "Executed SQL": False}
+    assert caps["risk_ops"]["Customer PII"] and caps["risk_ops"]["Executed SQL"]
+    assert caps["head_of_payments"]["SQL console"] and not caps["head_of_payments"]["Customer PII"]
+
+
+def test_audit_log_keeps_executed_sql_even_when_hidden_from_the_role(tmp_path):
+    from analyst.engine import AnalystEngine
+    db = os.path.join(os.path.dirname(__file__), "..", "data", "payments.duckdb")
+    eng = AnalystEngine(db, audit_path=str(tmp_path / "audit.jsonl"))
+    eng.ask("Success rate by merchant last week", "kam_portfolio_a", "rules", user="kam.a")
+    rows = eng.ex.read_audit(user="kam.a")
+    assert rows and all("merchant_id IN" in r["executable_sql"] for r in rows if r["status"] == "ok")
+
+
+def test_suggestions_only_offer_what_the_role_can_run():
+    from analyst.rbac import ROLES
+    from ui.pages import suggestions_for
+    eng = _engine()
+    for role_key, role in ROLES.items():
+        for q in suggestions_for(role):
+            a = eng.ask(q, role_key, "rules")
+            assert a.status != "denied", (role_key, q, a.message)
