@@ -25,12 +25,19 @@ def _secrets_to_env() -> None:
         items = list(st.secrets.items())
     except Exception:  # noqa: BLE001  no secrets file: local run, .env is used instead
         return
+    # names this app itself copied from secrets earlier: those follow later edits of the Secrets screen;
+    # anything set some other way (terminal, platform) is left untouched
+    ours = set(filter(None, os.environ.get("_PA_FROM_SECRETS", "").split(",")))
     for key, value in items:
         pairs = value.items() if hasattr(value, "items") else [(key, value)]
         for k, v in pairs:
             if isinstance(v, (str, int, float, bool)):
                 SECRET_NAMES.append(str(k))
-                os.environ.setdefault(str(k).upper(), str(v).strip())
+                name = str(k).upper()
+                if name in ours or name not in os.environ:
+                    os.environ[name] = str(v).strip()
+                    ours.add(name)
+    os.environ["_PA_FROM_SECRETS"] = ",".join(sorted(ours))
 
 
 _secrets_to_env()
@@ -48,15 +55,27 @@ st.set_page_config(page_title="Payments Analyst", page_icon="assets/logo_icon.sv
 theme.apply()
 
 
-@st.cache_resource
-def get_engine() -> AnalystEngine:
+LLM_SETTINGS = ("LLM_PROVIDER", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
+                "LLM_MODEL", "LLM_FALLBACK_MODELS")
+
+
+def _llm_fingerprint() -> str:
+    """One-way hash of the LLM settings. The engine is cached per fingerprint, so if the settings
+    change while the server runs (e.g. Streamlit Cloud secrets arriving after start-up), a new engine
+    with the new settings is built instead of the old one being reused."""
+    import hashlib
+    return hashlib.sha256("|".join(os.getenv(k, "") for k in LLM_SETTINGS).encode()).hexdigest()[:16]
+
+
+@st.cache_resource(max_entries=2)
+def get_engine(llm_fingerprint: str) -> AnalystEngine:
     if not os.path.exists(DB):
         from data.generate_data import main as gen
         gen(DB)
     return AnalystEngine(DB)
 
 
-eng = get_engine()
+eng = get_engine(_llm_fingerprint())
 
 
 def current_user():
