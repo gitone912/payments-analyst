@@ -108,8 +108,10 @@ serverless functions, while a Streamlit app is a long-running server holding a W
 4. **Deploy.** The first start installs the pinned requirements, and the first page load builds the
    database (~10 s). Leave the secrets out to run without an LLM (rule planner only).
 
-Notes: top-level secrets are copied into the environment at start-up (`app.py`), so the same
-variables as `.env` apply. The app is public: anyone with the link can sign in with the demo accounts
+Notes: secrets are copied into the environment at start-up (`app.py`): top level or inside a
+section, any letter case, so the same variables as `.env` apply. `GEMINI_API_KEY` alone is enough
+(the provider is detected from the key). If the sidebar still says **LLM off**, it lists the secret
+names it found (never values). The app is public: anyone with the link can sign in with the demo accounts
 and use your model quota, so use a dedicated key. Community Cloud apps sleep after inactivity and
 wake on the next visit; the audit log resets when the app restarts.
 
